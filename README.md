@@ -32,6 +32,8 @@ Robust, composable retries for HTTP, RPC, queues, and DB work. Rtry focuses on *
 - [Contributing](#contributing)
 - [License](#license)
 
+## The specification docs are in [SPEC.md](SPEC.md).
+
 ---
 
 ## Features
