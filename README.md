@@ -240,8 +240,8 @@ vendor/bin/phpunit
 ```
 
 ```md
-[![tests](https://github.com/Gohany/Rtry/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/OWNER/REPO/actions/workflows/tests.yml)
-[![codecov](https://codecov.io/gh/Gohany/Rtry/branch/main/graph/badge.svg)](https://codecov.io/gh/OWNER/REPO)
+[![tests](https://github.com/Gohany/Rtry/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/Gohany/Rtry/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/Gohany/Rtry/branch/master/graph/badge.svg)](https://codecov.io/gh/Gohany/Rtry)
 ```
 
 ---

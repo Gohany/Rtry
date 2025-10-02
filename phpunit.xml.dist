@@ -13,7 +13,7 @@
         </testsuite>
     </testsuites>
 
-    <coverage>
+    <source>
         <include>
             <directory suffix=".php">src/Impl</directory>
         </include>
@@ -22,9 +22,12 @@
             <directory>vendor</directory>
             <directory>src/Contracts</directory>
         </exclude>
+    </source>
+
+    <coverage>
         <report>
-          <clover outputFile="coverage.xml"/>
-          <html outputDirectory="build/coverage-html"/>
+            <clover outputFile="clover.xml"/>
         </report>
     </coverage>
+
 </phpunit>
