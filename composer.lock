@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "a305f777c6a37d3e00f1a908911b0c10",
+    "content-hash": "5b5e97fde1bd99c08c46a57591bbc5f6",
     "packages": [
         {
             "name": "gohany/retry",
