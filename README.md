@@ -50,10 +50,10 @@ Robust, composable retries for HTTP, RPC, queues, and DB work. Rtry focuses on *
 
 ## Install
 
-Via Composer (replace `vendor/package` if you publish under a different name):
+Via Composer:
 
 ```bash
-composer require vendor/package
+composer require Gohany/Rtry
 ```
 
 ---
@@ -238,7 +238,35 @@ Run the test suite:
 
 ```bash
 composer install
-vendor/bin/phpunit
+composer test
+```
+
+**Note:** The test suite is configured to generate code coverage reports. If you encounter "No code coverage driver available", you'll need to install either Xdebug or PCOV:
+
+### Installing a code coverage driver
+
+**Option 1: PCOV (recommended for performance)**
+```bash
+pecl install pcov
+```
+Then add to your `php.ini`:
+```ini
+extension=pcov.so
+```
+
+**Option 2: Xdebug**
+```bash
+pecl install xdebug
+```
+Then add to your `php.ini`:
+```ini
+zend_extension=xdebug.so
+xdebug.mode=coverage
+```
+
+**Run tests without coverage:**
+```bash
+composer test -- --no-coverage
 ```
 
 ---
