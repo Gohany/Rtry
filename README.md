@@ -1,4 +1,6 @@
-# Rtry — A pragmatic PHP retry & backoff toolkit
+# Rtry — A pragmatic PHP retry & backoff toolkit 
+[![tests](https://github.com/Gohany/Rtry/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/Gohany/Rtry/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/Gohany/Rtry/branch/master/graph/badge.svg)](https://codecov.io/gh/Gohany/Rtry)
 
 Robust, composable retries for HTTP, RPC, queues, and DB work. Rtry focuses on **clear policy specs**, **safe defaults**, and **first‑class support** for jitter, hedging, deadlines, and rate‑limit headers.
 
@@ -237,11 +239,6 @@ Run the test suite:
 ```bash
 composer install
 vendor/bin/phpunit
-```
-
-```md
-[![tests](https://github.com/Gohany/Rtry/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/Gohany/Rtry/actions/workflows/tests.yml)
-[![codecov](https://codecov.io/gh/Gohany/Rtry/branch/master/graph/badge.svg)](https://codecov.io/gh/Gohany/Rtry)
 ```
 
 ---
