@@ -70,7 +70,7 @@ use Gohany\Rtry\Impl\RtryPolicyFactory;
 $factory = new RtryPolicyFactory();
 $policy  = $factory->fromSpec('rtry:a=5;d=200;mode=exp;b=2;cap=8s;j=100@full;on=5xx,ETIMEDOUT');
 
-$retry = new Retry(); // uses default Clock, Sleeper, Logger
+$retry = new Retry(); // uses default Clock and Sleeper; no logger by default
 $result = $retry->try(function () {
     // Your flaky operation (HTTP call, DB query, etc)
     return 'ok';

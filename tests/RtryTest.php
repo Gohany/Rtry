@@ -16,7 +16,6 @@ use Gohany\Rtry\Impl\Retry;
 use Gohany\Rtry\Impl\RtryAttemptContext;
 use PHPUnit\Framework\TestCase;
 use Psr\Clock\ClockInterface;
-use Psr\Log\NullLogger;
 
 /**
  * Retry tests (AAA) with no anonymous test classes and no adapter.
@@ -27,7 +26,7 @@ final class RtryTest extends TestCase
 
     private function newRetry(TestFixedClock $clock, TestSleeperSpy $sleeper): Retry
     {
-        return new Retry($clock, $sleeper, new NullLogger());
+        return new Retry($clock, $sleeper, null);
     }
 
     // ================== TESTS ==================
