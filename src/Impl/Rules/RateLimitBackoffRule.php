@@ -5,7 +5,6 @@ namespace Gohany\Rtry\Impl\Rules;
 use Gohany\Rtry\Contracts\RuleInterface;
 use Gohany\Rtry\Contracts\FailureMetadataInterface;
 use Gohany\Rtry\Impl\FailureMetadata;
-use Psr\Http\Message\ResponseInterface;
 
 /**
  * Extracts backoff hints from HTTP response headers:
