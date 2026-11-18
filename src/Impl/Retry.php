@@ -4,6 +4,7 @@ namespace Gohany\Rtry\Impl;
 
 use Gohany\Retry\CircuitBreakerInterface;
 use Gohany\Retry\CircuitOpenException;
+use Gohany\Retry\CircuitState;
 use Gohany\Retry\GiveUpReason;
 use Gohany\Retry\RetryBudgetInterface;
 use Gohany\Retry\RetryerInterface;
@@ -24,7 +25,11 @@ use Throwable;
  *   tryOutcome() returns a RetryResult that also says why it stopped.
  * - Delays come from RtryScheduler: backoff, cap, jitter, Retry-After, deadline.
  * - Time comes from the one injected PSR-20 clock; waits go through the SleeperInterface.
- * - withGuard() adds a retry budget and/or circuit breaker for one downstream key.
+ * - withGuard() adds a retry budget and/or circuit breaker for one downstream key. A failure
+ *   that leaves the circuit open ends the run at once, without sleeping toward a retry the
+ *   breaker would refuse. A guard that throws (its store is down) never replaces the
+ *   operation's own value or error: the breaker fails open, the budget fails closed, a
+ *   failed report is ignored, and each is logged as retry.guard_error (class only).
  * - Per-attempt timeouts (t) are advisory and hedging (h) is a hint: PHP cannot pre-empt
  *   a running callable, and attempts run one at a time.
  *
@@ -118,7 +123,7 @@ final class Retry implements RetryerInterface, RetryHooksInterface
         $lastError = null;
 
         for ($attempt = 1; ; $attempt++) {
-            if ($this->breaker !== null && !$this->breaker->allow((string) $this->guardKey)) {
+            if (!$this->breakerAllows()) {
                 $error = $lastError ?? new CircuitOpenException((string) $this->guardKey);
                 return $this->giveUp($error, $attempt - 1, GiveUpReason::CircuitOpen);
             }
@@ -151,10 +156,12 @@ final class Retry implements RetryerInterface, RetryHooksInterface
                 );
                 $reason = $decision->giveUpReason();
 
-                if ($this->breaker !== null) {
-                    $reason === GiveUpReason::NotRetryable
-                        ? $this->breaker->recordSuccess((string) $this->guardKey)
-                        : $this->breaker->recordFailure((string) $this->guardKey);
+                $this->report('breaker', $reason === GiveUpReason::NotRetryable ? 'recordSuccess' : 'recordFailure');
+
+                // A circuit open now (this failure opened it, a probe failed, or another worker
+                // opened it) would refuse the retry: give up without sleeping first.
+                if ($reason === null && $this->circuitIsOpen()) {
+                    $reason = GiveUpReason::CircuitOpen;
                 }
 
                 if ($reason !== null) {
@@ -162,7 +169,7 @@ final class Retry implements RetryerInterface, RetryHooksInterface
                     return $this->giveUp($error, $attempt, $reason);
                 }
 
-                if ($this->budget !== null && !$this->budget->tryAcquire((string) $this->guardKey)) {
+                if (!$this->budgetAllowsRetry()) {
                     $this->runGiveUpHook($attemptContext, $outcome, $policy, $metadata->getHeaders());
                     return $this->giveUp($error, $attempt, GiveUpReason::BudgetExhausted);
                 }
@@ -173,12 +180,89 @@ final class Retry implements RetryerInterface, RetryHooksInterface
                 continue;
             }
 
-            $this->breaker?->recordSuccess((string) $this->guardKey);
-            $this->budget?->recordSuccess((string) $this->guardKey);
+            $this->report('breaker', 'recordSuccess');
+            $this->report('budget', 'recordSuccess');
             $this->log('info', 'retry.success', ['attempt' => $attempt, 'elapsed_ms' => $this->nowMs() - $firstMs]);
 
             return RetryResult::success($value, $attempt);
         }
+    }
+
+    /** Before each attempt. A breaker that throws (its store is down) lets the attempt run. */
+    private function breakerAllows(): bool
+    {
+        if ($this->breaker === null) {
+            return true;
+        }
+        try {
+            return $this->breaker->allow((string) $this->guardKey);
+        } catch (Throwable $e) {
+            $this->guardError('breaker', 'allow', $e);
+            return true;
+        }
+    }
+
+    /**
+     * After a retryable failure, before sleeping: is the circuit anything but closed? Open
+     * refuses every caller and half-open has its probe out, so the retry would be refused.
+     * A breaker that throws counts as closed.
+     */
+    private function circuitIsOpen(): bool
+    {
+        if ($this->breaker === null) {
+            return false;
+        }
+        try {
+            return $this->breaker->state((string) $this->guardKey) !== CircuitState::Closed;
+        } catch (Throwable $e) {
+            $this->guardError('breaker', 'state', $e);
+            return false;
+        }
+    }
+
+    /** Before each retry. A budget that throws refuses: no extra load while it cannot count. */
+    private function budgetAllowsRetry(): bool
+    {
+        if ($this->budget === null) {
+            return true;
+        }
+        try {
+            return $this->budget->tryAcquire((string) $this->guardKey);
+        } catch (Throwable $e) {
+            $this->guardError('budget', 'tryAcquire', $e);
+            return false;
+        }
+    }
+
+    /**
+     * Tell a guard an attempt's result. A guard that throws is logged and ignored: the
+     * operation's own value or error is the outcome.
+     *
+     * @param 'breaker'|'budget' $guard
+     * @param 'recordSuccess'|'recordFailure' $call
+     */
+    private function report(string $guard, string $call): void
+    {
+        $target = $guard === 'breaker' ? $this->breaker : $this->budget;
+        if ($target === null) {
+            return;
+        }
+        try {
+            $target->{$call}((string) $this->guardKey);
+        } catch (Throwable $e) {
+            $this->guardError($guard, $call, $e);
+        }
+    }
+
+    private function guardError(string $guard, string $call, Throwable $e): void
+    {
+        // Class only: a store error's message can carry a host, a DSN or a credential.
+        $this->log('warning', 'retry.guard_error', [
+            'guard' => $guard,
+            'call' => $call,
+            'key' => $this->guardKey,
+            'exception_class' => get_class($e),
+        ]);
     }
 
     private function giveUp(Throwable $error, int $attempts, GiveUpReason $reason): RetryResult

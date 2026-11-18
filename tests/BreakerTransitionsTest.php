@@ -299,9 +299,8 @@ final class BreakerTransitionsTest extends TestCase
 
         $first = $retry->tryOutcome($alwaysDown, $policy);
         self::assertSame([2, GiveUpReason::CircuitOpen], [$first->attempts(), $first->giveUpReason()]);
-        // v2.0 behaviour, unchanged here: after the failure that opens the circuit, Retry still
-        // sleeps the next delay (200 ms) and only then finds the circuit open.
-        self::assertSame([100, 200], $sleeper->sleeps());
+        // The failure that opens the circuit ends the run at once: no 200 ms wait first.
+        self::assertSame([100], $sleeper->sleeps());
         self::assertSame(['search-api closed->open @100'], $this->seen);
 
         try {
@@ -314,9 +313,9 @@ final class BreakerTransitionsTest extends TestCase
         $this->clock->advanceMs(5_000);
         self::assertSame('ok', $retry->try(static fn (): string => 'ok', $policy));
         self::assertSame(
-            ['search-api closed->open @100', 'search-api open->half_open @5300', 'search-api half_open->closed @5300'],
+            ['search-api closed->open @100', 'search-api open->half_open @5100', 'search-api half_open->closed @5100'],
             $this->seen
         );
-        self::assertSame([100, 200], $sleeper->sleeps(), 'the probe ran without sleeping');
+        self::assertSame([100], $sleeper->sleeps(), 'the probe ran without sleeping');
     }
 }
