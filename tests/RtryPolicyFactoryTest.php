@@ -117,7 +117,8 @@ final class RtryPolicyFactoryTest extends TestCase
         $this->assertSame(100, $policy->delayMs());
         $this->assertSame(3, $policy->attempts());
         $this->assertSame(8000, $policy->deadlineBudgetMs());
-        $this->assertSame(100, $policy->startAfterMs());
+        // sa=50 under j=100ms@full: full jitter never goes above the value it jitters (was 100 in 1.0.x).
+        $this->assertSame(50, $policy->startAfterMs());
         $this->assertSame(false, $policy->followHeaders());
         $this->assertSame(12000, $policy->capMs());
 

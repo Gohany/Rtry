@@ -65,7 +65,8 @@ class Jitter extends Part implements PartInterface, JitterInterface
             : $this->windowMs ?? 0;
 
         if ($window <= 0) {
-            return $this->mode === 'pm' ? $nominalDelayMs : 0;
+            // j=0 or j=0%: no jitter, in either mode.
+            return $nominalDelayMs;
         }
 
         if ($this->mode === 'pm') {
@@ -74,8 +75,8 @@ class Jitter extends Part implements PartInterface, JitterInterface
             return max($v, 0);
         }
 
-        // 'full' mode
-        return $this->randInRange(0, $window, $seed, $nominalDelayMs);
+        // 'full' mode: up to $window below the delay, never above it (j=100% is [0, delay]).
+        return $this->randInRange(max(0, $nominalDelayMs - $window), $nominalDelayMs, $seed, $nominalDelayMs);
     }
 
     public function key(): string

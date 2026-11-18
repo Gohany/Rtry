@@ -4,10 +4,13 @@ namespace Gohany\Rtry\Impl;
 
 use Gohany\Retry\RetryDeciderInterface;
 use Gohany\Retry\RetryPolicyFactoryInterface;
+use Gohany\Rtry\Contracts\FailureClassifierInterface;
 use Gohany\Rtry\Contracts\GeneratesRulesInterface;
 use Gohany\Rtry\Contracts\PartInterface;
 use Gohany\Rtry\Contracts\RtryPolicyInterface;
+use Gohany\Rtry\Contracts\RuleBasedClassifierInterface;
 use Gohany\Rtry\Impl\Deciders\AlwaysRetryDecider;
+use Gohany\Rtry\Impl\Deciders\OnTokensDecider;
 use Gohany\Rtry\Impl\Parts\Attempts;
 use Gohany\Rtry\Impl\Parts\Base;
 use Gohany\Rtry\Impl\Parts\Cap;
@@ -62,12 +65,6 @@ final class RtryPolicyFactory implements RetryPolicyFactoryInterface
             throw new \InvalidArgumentException('Empty rtry spec.');
         }
 
-        // Use provided decider or overrides
-        $decider = $this->deciderOverride ?? $decider ?? new AlwaysRetryDecider();
-
-        $policy = new RtryPolicy();
-        $policy->setRetryDecider($decider);
-
         $pairs = array_map('trim', explode(';', $s));
         $map = [];
         $orderedParts = [];
@@ -101,6 +98,14 @@ final class RtryPolicyFactory implements RetryPolicyFactoryInterface
 
         $this->lastParts = $orderedParts;
 
+        // Use the override or the provided decider. Without either, on= decides what retries
+        // (its tokens reach the OnTokensDecider below); with no on= every failure retries.
+        $decider = $this->deciderOverride ?? $decider
+            ?? (isset($map[On::KEY]) ? new OnTokensDecider([]) : new AlwaysRetryDecider());
+
+        $policy = new RtryPolicy();
+        $policy->setRetryDecider($decider);
+
         foreach ($orderedParts as $part) {
 
             if ($part instanceof PartInterface) {
@@ -108,7 +113,15 @@ final class RtryPolicyFactory implements RetryPolicyFactoryInterface
             }
 
             if ($part instanceof GeneratesRulesInterface) {
-                $part->addRulesToClassifier($policy->failureClassifier());
+                // A fresh policy has no classifier, so the part builds one; keep it, or the
+                // decider never sees a status code or tag and the generated rules never run.
+                $classifier = $policy->failureClassifier();
+                if ($classifier === null || $classifier instanceof RuleBasedClassifierInterface) {
+                    $classifier = $part->addRulesToClassifier($classifier);
+                    if ($classifier instanceof FailureClassifierInterface) {
+                        $policy->setFailureClassifier($classifier);
+                    }
+                }
             }
 
         }

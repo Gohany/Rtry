@@ -130,6 +130,11 @@ Jitter smooths out stampedes by randomizing delays.
 '50@pm',   '100ms@pm',   '10m@pm',   '20%@pm',
 ```
 
+How a delay `D` is jittered with a window `W` (a duration, or a percent of `D`):
+- `full` draws uniformly from `[max(0, D - W), D]`: never above `D`, so `j=100%@full` is the classic `[0, D]`.
+- `pm` draws uniformly from `[max(0, D - W), D + W]`.
+- `j=0` (or `0%`) is no jitter: the delay is `D`.
+
 ### Hedging
 
 Run multiple lanes concurrently with a **stagger delay**, cancel others on first success/completion.
@@ -191,15 +196,17 @@ You can configure multiple candidate values per key (the factory will validate &
 | Key   | Meaning                 | Examples                                                                                      |
 |-------|-------------------------|-----------------------------------------------------------------------------------------------|
 | `a`   | attempts                | `5`, `[5,10]`                                                                                 |
+| `d`   | backoff delay: `exp` waits `d, d*b, d*b^2, …`; `lin` waits `d, 2d, 3d, …` | `200`, `'1s'` |
+| `m`   | backoff mode (in 1.x a `d=` selects `lin` unless an `m=` or `b=` comes after it) | `exp`, `lin`, `seq` |
 | `sa`  | start after             | `200`, `'200ms'`, `'200s'`, `'2m'`, `'1h'`                                                    |
 | `dl`  | deadline budget         | `200`, `'200ms'`, `'2s'`, `'1m'`                                                              |
-| `cap` | cap for attempts        | `'200ms'`, `'2m'`, `'1h'`                                                                     |
+| `cap` | max delay between attempts (omit for no cap) | `'200ms'`, `'2m'`, `'1h'`                                                |
 | `j`   | jitter                  | `'20%@pm'`, `'100ms@pm'`, `'50@full'`, `'1.5m@full'`                                          |
 | `h`   | hedge                   | `'2@100ms'`, `'3@100&1'`                                                                      |
 | `seq` | explicit delay sequence | `'(50,100ms,1.5s*)'`, `'seq=(50,100,1.5s,*)'`, `'50,100,1.5s*'` (canonical prints as `seq=…`) |
 | `fh`  | follow headers (bool)   | `true` / `false`                                                                              |
 | `b`   | exponential base        | `2`, `2.5`                                                                                    |
-| `on`  | on tags                 | `5xx`, `429`, `ratelimit`, `throttle`, `4xx`                                                   |
+| `on`  | retryable statuses/tags (without a decider passed in, only these retry; `default` = the default set) | `5xx`, `429`, `ETIMEDOUT`, `default` |
 
 > **Tip:** numbers without unit default to **milliseconds**. `1.5m` and `1.5s` are supported; decimals for `h/m/s` are allowed.
 
