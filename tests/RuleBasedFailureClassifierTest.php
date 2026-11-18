@@ -11,7 +11,7 @@ use PHPUnit\Framework\TestCase;
 final class RuleBasedFailureClassifierTest extends TestCase
 {
 
-    public function test_merges_status_tags_context_delays_and_headers_from_rules_and_includes_message_tags(): void
+    public function test_merges_status_tags_context_delays_and_headers_from_rules(): void
     {
         // Arrange
         $c = new RuleBasedFailureClassifier();
@@ -35,7 +35,9 @@ final class RuleBasedFailureClassifierTest extends TestCase
         $c->addRule(new TestRule($m1));
         $c->addRule(new TestRule($m2));
 
-        // Exception message should add ETIMEDOUT and ECONNRESET tokens via collectTags()
+        // The rules' statuses were not read from a response, so the message still adds tags,
+        // as in 2.x; but only from transport phrases: "connection reset" counts, a bare
+        // "timeout" does not.
         $e = new \RuntimeException('Operation timeout due to connection reset');
 
         // Act
@@ -50,8 +52,8 @@ final class RuleBasedFailureClassifierTest extends TestCase
         $this->assertContains('A', $tags);
         $this->assertContains('B', $tags);
         $this->assertContains('C', $tags);
-        $this->assertContains('ETIMEDOUT', $tags);
         $this->assertContains('ECONNRESET', $tags);
+        $this->assertNotContains('ETIMEDOUT', $tags, 'a bare "timeout" is not transport evidence');
 
         $this->assertSame(['x' => '1', 'y' => '2', 'z' => '3'],
             $meta->getContextPatch(),
@@ -83,7 +85,7 @@ final class RuleBasedFailureClassifierTest extends TestCase
 
         // Assert
         $this->assertSame(502, $meta->getStatusCode());
-        $this->assertContains('NETWORK_ERROR', $meta->getTags(), 'message contains "network error"');
+        $this->assertContains('NETWORK_ERROR', $meta->getTags(), 'a code is not a response: the message still counts');
     }
 
     public function test_rule_returning_array_of_metas_is_supported_and_merged(): void
@@ -96,7 +98,7 @@ final class RuleBasedFailureClassifierTest extends TestCase
         $c->addRule(new TestRule($m1));
         $c->addRule(new TestRule($m2));
 
-        $e = new \RuntimeException('timeout'); // adds ETIMEDOUT
+        $e = new \RuntimeException('timeout'); // no ETIMEDOUT: a bare "timeout" is not transport evidence
 
         // Act
         $meta = $c->classify($e);
@@ -109,7 +111,7 @@ final class RuleBasedFailureClassifierTest extends TestCase
         $tags = $meta->getTags();
         $this->assertContains('T1', $tags);
         $this->assertContains('T2', $tags);
-        $this->assertContains('ETIMEDOUT', $tags);
+        $this->assertNotContains('ETIMEDOUT', $tags);
 
         $headers = array_change_key_case($meta->getHeaders(), CASE_LOWER);
         $this->assertSame(['a', 'b'], $headers['h1']);

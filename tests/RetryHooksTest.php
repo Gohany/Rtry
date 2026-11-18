@@ -46,8 +46,13 @@ final class RetryHooksTest extends TestCase
             return 'ok';
         }, (new RtryPolicyFactory())->fromSpec('rtry:a=2;d=100'));
 
-        self::assertSame([[1, 429, 3000, ['retry-after' => ['3']]]], $seen);
-        self::assertSame([3000], $this->sleeper->sleeps());
+        // Full jitter spreads above the server's 3 s, by up to the 100 ms backoff.
+        self::assertCount(1, $seen);
+        [$attempt, $status, $sleepMs, $headers] = $seen[0];
+        self::assertSame([1, 429, ['retry-after' => ['3']]], [$attempt, $status, $headers]);
+        self::assertGreaterThanOrEqual(3000, $sleepMs);
+        self::assertLessThanOrEqual(3100, $sleepMs);
+        self::assertSame([$sleepMs], $this->sleeper->sleeps());
     }
 
     public function testGiveUpHookRunsOnceAndHookErrorsAreSwallowed(): void

@@ -9,16 +9,15 @@ use Psr\Http\Message\ResponseInterface;
  */
 final class HttpFailure extends \RuntimeException
 {
-    /** @param array<string,string> $headers */
-    public function __construct(private ResponseInterface $response)
+    public function __construct(private ResponseInterface $response, ?string $message = null)
     {
-        parent::__construct('HTTP ' . $response->getStatusCode());
+        parent::__construct($message ?? 'HTTP ' . $response->getStatusCode());
     }
 
     /** @param array<string,string> $headers */
-    public static function status(int $status, array $headers = []): self
+    public static function status(int $status, array $headers = [], ?string $message = null): self
     {
-        return new self(new FakeResponse($status, $headers));
+        return new self(new FakeResponse($status, $headers), $message);
     }
 
     public function getResponse(): ResponseInterface

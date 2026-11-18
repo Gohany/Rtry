@@ -41,6 +41,7 @@ final class Retry implements RetryerInterface, RetryHooksInterface
     private readonly ClockInterface $clock;
     private readonly SleeperInterface $sleeper;
     private readonly RtryScheduler $scheduler;
+    private readonly Randomizer $random;
     private readonly FailureClassifierInterface $fallbackClassifier;
 
     private ?string $guardKey = null;
@@ -64,7 +65,8 @@ final class Retry implements RetryerInterface, RetryHooksInterface
     ) {
         $this->clock = $clock ?? new NativeClock();
         $this->sleeper = $sleeper ?? new NativeSleeper();
-        $this->scheduler = new RtryScheduler($this->clock, $random ?? new Randomizer());
+        $this->random = $random ?? new Randomizer();
+        $this->scheduler = new RtryScheduler($this->clock, $this->random);
         $this->fallbackClassifier = RuleBasedFailureClassifier::default();
     }
 
@@ -139,15 +141,18 @@ final class Retry implements RetryerInterface, RetryHooksInterface
                 foreach ($metadata->getContextPatch() as $k => $v) {
                     $context[$k] = $v;
                 }
-                $outcome = RtryAttemptOutcome::fromMetadata($error, $metadata, $this->nowMs());
-
-                // Never log the message: it can carry request data. Class, status and tags only.
-                $this->log('warning', 'retry.failure', [
-                    'attempt' => $attempt,
-                    'exception_class' => get_class($error),
-                    'status_code' => $outcome->statusCode(),
-                    'tags' => $outcome->tags(),
-                ]);
+                $now = $this->nowMs();
+                $outcome = RtryAttemptOutcome::fromMetadata($error, $metadata, $now);
+                if ($policy->followHeaders() && $outcome->notBeforeUnixMs() !== null) {
+                    // Spread above the server's time, never below it, and never past dl or
+                    // the scheduler's ceiling when the server's own time fits them.
+                    $outcome = $outcome->spreadAboveServerTime(
+                        $now,
+                        RtryScheduler::headerSpreadMs($policy, $attempt, $this->random),
+                        $deadlineMs,
+                        $this->scheduler->maxHeaderWaitMs(),
+                    );
+                }
 
                 $decision = $this->scheduler->next(
                     $policy,
@@ -155,6 +160,16 @@ final class Retry implements RetryerInterface, RetryHooksInterface
                     $this->context($attempt, $maxAttempts, $delay, $firstMs, $deadlineMs, $context),
                 );
                 $reason = $decision->giveUpReason();
+
+                // A failure the policy does not retry (a 404, a validation error) is the caller's
+                // business, not a retry event: debug. Never log the message: it can carry
+                // request data. Class, status and tags only.
+                $this->log($reason === GiveUpReason::NotRetryable ? 'debug' : 'warning', 'retry.failure', [
+                    'attempt' => $attempt,
+                    'exception_class' => self::className($error),
+                    'status_code' => $outcome->statusCode(),
+                    'tags' => $outcome->tags(),
+                ]);
 
                 $this->report('breaker', $reason === GiveUpReason::NotRetryable ? 'recordSuccess' : 'recordFailure');
 
@@ -261,18 +276,33 @@ final class Retry implements RetryerInterface, RetryHooksInterface
             'guard' => $guard,
             'call' => $call,
             'key' => $this->guardKey,
-            'exception_class' => get_class($e),
+            'exception_class' => self::className($e),
         ]);
     }
 
+    /**
+     * A give-up is never logged at error: the caller gets the error back and decides how loud
+     * to be. Not retryable is debug; out of attempts, deadline, budget or circuit is warning.
+     */
     private function giveUp(Throwable $error, int $attempts, GiveUpReason $reason): RetryResult
     {
-        $this->log('error', 'retry.give_up', [
+        $this->log($reason === GiveUpReason::NotRetryable ? 'debug' : 'warning', 'retry.give_up', [
             'attempts' => $attempts,
             'reason' => $reason->value,
-            'last_error_class' => get_class($error),
+            'last_error_class' => self::className($error),
         ]);
         return RetryResult::gaveUp($error, $attempts, $reason);
+    }
+
+    /**
+     * The class to log: an anonymous class's name carries a NUL byte and its file path after
+     * "@anonymous", so it stops there.
+     */
+    private static function className(Throwable $e): string
+    {
+        $class = $e::class;
+        $at = strpos($class, '@anonymous');
+        return $at === false ? $class : substr($class, 0, $at + strlen('@anonymous'));
     }
 
     /** @param array<string,mixed> $context */

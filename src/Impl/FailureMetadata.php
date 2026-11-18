@@ -21,10 +21,14 @@ final class FailureMetadata implements FailureMetadataInterface
     /** @var array<string, array<int,string>> */
     private array $headers;
 
+    private bool $fromResponse;
+
     /**
      * @param array<int,string> $tags
      * @param array<string,mixed> $ctxPatch
      * @param array<string, array<int,string>> $headers
+     * @param bool $fromResponse the status was read from an HTTP response the error carries
+     *        (not its exception code): only then does a non-retryable status decide alone
      */
     public function __construct(
         ?int $statusCode,
@@ -32,7 +36,8 @@ final class FailureMetadata implements FailureMetadataInterface
         array $ctxPatch = [],
         ?int $minNextDelayMs = null,
         ?int $notBeforeUnixMs = null,
-        array $headers = []
+        array $headers = [],
+        bool $fromResponse = false,
     ) {
         $this->statusCode = $statusCode;
         $this->tags = array_values(array_unique($tags));
@@ -40,6 +45,12 @@ final class FailureMetadata implements FailureMetadataInterface
         $this->minNextDelayMs = $minNextDelayMs;
         $this->notBeforeUnixMs = $notBeforeUnixMs;
         $this->headers = $headers;
+        $this->fromResponse = $fromResponse;
+    }
+
+    public function isFromResponse(): bool
+    {
+        return $this->fromResponse;
     }
 
     public function getStatusCode(): ?int

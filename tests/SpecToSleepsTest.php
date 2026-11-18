@@ -163,7 +163,7 @@ final class SpecToSleepsTest extends TestCase
         self::assertSame([3, GiveUpReason::AttemptsExhausted], [$result->attempts(), $result->giveUpReason()]);
     }
 
-    /** Bug 7: a string spec follows Retry-After, above the cap. */
+    /** Bug 7: a string spec follows Retry-After, above the cap; jitter only adds above it. */
     public function testRetryAfterSecondsIsWaitedOut(): void
     {
         $policy = (new RtryPolicyFactory())->fromSpec('rtry:a=2;d=100;cap=1s');
@@ -171,7 +171,9 @@ final class SpecToSleepsTest extends TestCase
         $value = $this->retry->try(self::failing(1, self::http(429, ['Retry-After' => '2'])), $policy);
 
         self::assertSame('ok', $value);
-        self::assertSame([2000], $this->sleeper->sleeps());
+        self::assertCount(1, $this->sleeper->sleeps());
+        self::assertGreaterThanOrEqual(2000, $this->sleeper->sleeps()[0]);
+        self::assertLessThanOrEqual(2100, $this->sleeper->sleeps()[0]);
     }
 
     public function testRetryAfterHttpDateAndRateLimitResetAreWaitedOut(): void
@@ -201,19 +203,19 @@ final class SpecToSleepsTest extends TestCase
     public function testGiveUpRethrowsTheLastErrorAndTryOutcomeSaysWhy(): void
     {
         $policy = (new RtryPolicyFactory())->fromSpec('rtry:a=3;d=10;j=0');
-        $op = static fn (AttemptContextInterface $a) => throw new \RuntimeException('timeout on attempt ' . $a->attemptNumber());
+        $op = static fn (AttemptContextInterface $a) => throw new \RuntimeException('connection timed out on attempt ' . $a->attemptNumber());
 
         try {
             $this->retry->try($op, $policy);
             self::fail('try() must rethrow on give-up');
         } catch (\RuntimeException $e) {
-            self::assertSame('timeout on attempt 3', $e->getMessage());
+            self::assertSame('connection timed out on attempt 3', $e->getMessage());
         }
 
         $result = $this->retry->tryOutcome($op, $policy);
         self::assertFalse($result->isSuccess());
         self::assertSame(GiveUpReason::AttemptsExhausted, $result->giveUpReason());
-        self::assertSame('timeout on attempt 3', $result->lastError()?->getMessage());
+        self::assertSame('connection timed out on attempt 3', $result->lastError()?->getMessage());
     }
 
     /** Deadline: never sleeps past dl. */

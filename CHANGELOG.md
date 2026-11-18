@@ -2,6 +2,99 @@
 
 ## Unreleased
 
+Planned as 2.3.0. No change to the gohany/retry interfaces and no method removed; every
+constructor and method change is an optional argument. Some behaviour changes on purpose. Each
+is a fix for a failure that retried when it should not have, or the reverse. They are listed
+under Changed so you can check them against your specs.
+
+### Changed
+
+- **A status read from an HTTP response decides, wherever it sits on the error.** Rtry looks
+  along the `getPrevious()` chain for a response (`getResponse()`, PSR-7 or Symfony-shaped)
+  Laravel's `RequestException` `$response` property (`status()`, `headers()`), or a status
+  accessor (`getStatusCode()`, `getHttpStatus()`, `getHttpStatusCode()`). A
+  retryable status (408, 429, 5xx) keeps the error's transport tags, as in 2.2. Any other
+  (a 4xx, a 1xx-3xx, a status above 599) gets no tags. A wrapped 404 whose URL says
+  "timeout", or a 422 whose body says "card refused", used to retry under `on=default`; it
+  now runs once. Laravel's HTTP client is read without a reader: a 422 whose body says "timed
+  out" used to retry, and a 429 or 503 used to ignore its `Retry-After`; now the status
+  decides and the header is honoured.
+- **Tags need transport evidence.** `ETIMEDOUT`, `ECONNREFUSED` and their siblings come
+  from transport types (PSR-18 `NetworkExceptionInterface`, Symfony HttpClient
+  `TransportExceptionInterface`), a cURL error number, an errno name (`ECONNREFUSED`,
+  `ETIMEDOUT`, `ECONNRESET`), or a specific phrase ("connection refused", "timed out",
+  "connection reset", "timeout waiting", ...), on the error or anything in its chain. Driver
+  timeouts 2.2 retried still retry: PostgreSQL's statement and lock timeouts (SQLSTATE 57014,
+  55P03; the lock timeout is also `DEADLOCK`), MongoDB's "socket error or timeout", Oracle's
+  ORA-12170 and libmemcached's "timeout occurred", and Go's "i/o timeout". They no longer come
+  from a bare "timeout" or "refused". A `LogicException` or
+  an `\Error` never gets tags from its message. `InvalidArgumentException('timeout must be a
+  positive integer')` and `DomainException('Payment refused by issuer')` used to retry; they
+  now run once. If you relied on a word match, add a `MessageRegexRule` or an `InstanceOfRule`.
+- **An exception code is still a status for `on`, as in 2.x, but it never silences tags.**
+  `new RuntimeException('421 4.4.2 Connection timed out', 421)` (SMTP) and a deadlock coded
+  409 keep `ETIMEDOUT` and `DEADLOCK` and retry under `on=default`.
+- **Rate-limit reset headers only when the limit was hit.** `RateLimit-Reset(-After)` and
+  `X-RateLimit-Reset(-After|-Ms)` used to set a wait on any response. Many APIs send them
+  on every response, so a 502 could wait out an hour. They now set a wait only on a 429, a
+  503, or a response whose `RateLimit-Remaining` / `X-RateLimit-Remaining` is 0.
+- **`RATE_LIMITED` only on a status that can mean it.** It is tagged when one of those waits,
+  or `Retry-After`, is found on a 403, 408, 429 or 5xx. A 403 that is a rate limit (GitHub
+  sends `Retry-After`, or `X-RateLimit-Remaining: 0` with `X-RateLimit-Reset`) retries under
+  `on=default` as in 2.2, waiting what the server said, and `on=RATE_LIMITED` still matches a
+  500 with `Retry-After`. Two changes from 2.2: any other 4xx (a 404, a 422) carrying
+  `Retry-After` now runs once, and `RATE_LIMITED` is never tagged below 400. To retry such a
+  4xx, list its status in `on` (`on=default,423`); the wait is still read from its
+  `Retry-After`.
+- **A server's wait is jittered above, never below.** In-process (`Retry`), and for durable
+  callers that pass the policy to `RtryAttemptOutcome::fromError()`, a `Retry-After` gets the
+  policy's jitter window for that attempt added on top. Callers told "2 s" no longer return in
+  the same millisecond. `j=0` waits exactly what the server said. When the server's own wait
+  fits inside `dl`, the spread never pushes it past `dl`; on the durable path that needs the
+  attempt's context passed to `fromError()` (its new optional `$context` argument), since `dl`
+  lives there. `RtryScheduler::next()` itself is unchanged (gohany/retry SPEC 5.11 step 5).
+- **A server's wait over a day gives up** with `DeadlineExceeded` instead of sleeping
+  (`RtryScheduler::MAX_HEADER_WAIT_MS`, or the scheduler's new optional `$maxHeaderWaitMs`
+  argument). The server's own wait decides, not the jitter on top of it: `Retry-After: 86400`
+  is honoured with or without jitter, and the spread never pushes a wait that fits past the
+  ceiling. Waits under that are still honoured above `cap`, as the SPEC requires.
+- **No give-up is logged at `error`.** A failure the policy does not retry and its give-up are
+  logged at `debug` (`retry.failure` was `warning`, `retry.give_up` was `error`). Any other
+  give-up (attempts, deadline, budget, circuit) is logged at `warning`, not `error`. If you
+  alert on `retry.give_up` at `error`, alert on `warning` or use `setOnGiveUpHook()`.
+
+### Fixed
+
+- A response header can no longer replace the operation's error. `Retry-After:
+  @9223372036854776`, `9223372036854770`, `99999999999999999999` or `1e400`, and the
+  same in the `RateLimit-Reset*` headers, used to throw a `TypeError` or (on PHP 8.5) an
+  `E_WARNING` out of `try()`, or wrap to a negative wait. Values are parsed without
+  float-to-int casts: absurd waits give up, unreadable ones are ignored. "tomorrow" and
+  "next year" are no longer HTTP dates. The IMF-fixdate, RFC 850 and asctime formats are
+  read, and so is a date-shaped string with a zone such as `+0000`.
+- A header value that is a nested list no longer raises "Array to string conversion".
+- An anonymous exception class is logged as `RuntimeException@anonymous`, without the NUL
+  byte and file path PHP appends to its name.
+
+### Added
+
+- `ErrorResponseLocator`: finds the response on an error, wherever it sits, and reads each
+  error once for all the rules that share it. `Contracts\ErrorResponseReaderInterface` and
+  `Contracts\ErrorResponse` (a status and lower-cased headers) let you add a reader for a
+  client that keeps its response somewhere else. Pass it to
+  `RuleBasedFailureClassifier::default($reader)`.
+  It is tried first, and the default reading still follows, so PSR-7 errors keep working
+  next to it. README, "Responses Rtry cannot find".
+- `Rules\ResponseStatusRule`: the status from the locator. `default()` keeps
+  `MethodStatusRule(['getResponse'])` first, as in 2.x, so `hasRuleOfType(MethodStatusRule::class)`
+  is still true.
+- `FailureMetadata::isFromResponse()` and its optional `$fromResponse` constructor argument,
+  `RtryScheduler::headerSpreadMs()` and `RtryScheduler::maxHeaderWaitMs()`, and
+  `RtryAttemptOutcome::fromError()`'s optional `$policy`, `$failedAttempt`, `$random`,
+  `$context` and `$maxHeaderWaitMs` arguments.
+
+## 2.2.0 — 2026-11-18
+
 No interface changes; two behaviour fixes for callers using `withGuard()`.
 
 ### Fixed

@@ -2,196 +2,189 @@
 
 namespace Gohany\Rtry\Impl\Rules;
 
-use Gohany\Rtry\Contracts\RuleInterface;
+use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
 use Gohany\Rtry\Contracts\FailureMetadataInterface;
+use Gohany\Rtry\Contracts\RuleInterface;
+use Gohany\Rtry\Impl\ErrorResponseLocator;
 use Gohany\Rtry\Impl\FailureMetadata;
+use Gohany\Rtry\Impl\FailureToken;
+use Gohany\Rtry\Impl\HeaderWaits;
 
 /**
- * Extracts backoff hints from HTTP response headers:
- * - Retry-After: seconds (delta) or HTTP-date (absolute)
- * - RateLimit-Reset / X-RateLimit-Reset: delta seconds below 10^9, otherwise epoch seconds or ms
- * - RateLimit-Reset-After / X-RateLimit-Reset-After: delta seconds
+ * Turns a server's wait into a delay hint, from the response an error carries (found by an
+ * ErrorResponseLocator, wherever it sits on the error):
  *
- * Tags 'RATE_LIMITED' when a rate-limit header is observed.
+ * - Retry-After, on any response: delay seconds, or an HTTP date (IMF-fixdate, RFC 850,
+ *   asctime, or "Day, DD Mon YYYY HH:MM:SS" with a zone). Words such as "tomorrow" are not
+ *   dates here.
+ * - RateLimit-Reset-After / X-RateLimit-Reset-After (delta seconds), X-RateLimit-Reset-Ms
+ *   (epoch ms), RateLimit-Reset / X-RateLimit-Reset (delta seconds below 10^9, otherwise epoch
+ *   seconds, or epoch ms from 10^12), only on a 429, a 503, or a response whose
+ *   RateLimit-Remaining / X-RateLimit-Remaining is 0. Many APIs send these on every response,
+ *   so with quota left they are not a wait and not a sign of rate limiting.
+ *
+ * Tags RATE_LIMITED when one of these waits is found on a status that can say "rate limited":
+ * 403 (GitHub's primary and secondary limits), 408, 429 or 5xx. Never on another 4xx (a 404 or
+ * a 422 with Retry-After still runs once) and never below 400.
+ * Values are parsed defensively: a huge, negative, NaN or malformed value never warns or
+ * throws; a huge one is pinned to HeaderWaits' bounds and the scheduler gives up on it.
  */
 final class RateLimitBackoffRule implements RuleInterface
 {
-    /**
-     * Extract backoff hints from common rate-limit headers.
-     * Returns FailureMetadata with:
-     *  - status (only if >= 400),
-     *  - tags ['RATE_LIMITED'],
-     *  - context patch (empty array here),
-     *  - either minNextDelayMs OR notBeforeUnixMs,
-     *  - echoed subset of headers that influenced the decision.
-     */
+    private const DATE_FORMATS = [
+        'D, d M Y H:i:s \G\M\T', // IMF-fixdate (RFC 9110)
+        'l, d-M-y H:i:s \G\M\T', // RFC 850
+        'D M j H:i:s Y',         // asctime
+    ];
+
+    private readonly ErrorResponseLocator $locator;
+
+    public function __construct(?ErrorResponseReaderInterface $reader = null)
+    {
+        $this->locator = ErrorResponseLocator::wrap($reader);
+    }
+
     public function apply(\Throwable $e): ?FailureMetadataInterface
     {
-        // 1) Find a PSR-7 response on the exception.
-        $response = $this->extractResponse($e);
+        $response = $this->locator->read($e);
         if ($response === null) {
             return null;
         }
-
-        // 2) Normalize headers to a simple lowercase map: name => firstValueString.
-        $headers = $this->normalizeHeaders($response->getHeaders());
+        $headers = self::firstValues($response->headers);
         if ($headers === []) {
             return null;
         }
 
-        // 3) Compute backoff hints from the headers (Retry-After, RateLimit-Reset*, etc).
-        $hints = $this->computeBackoffFromHeaders($headers);
-        if ($hints === null) {
-            return null; // No recognizable rate-limit hints.
+        $status = $response->statusCode;
+        $resetCounts = $status === 429 || $status === 503 || self::quotaExhausted($headers);
+        $hint = self::retryAfter($headers) ?? ($resetCounts ? self::resetHeaders($headers) : null);
+        if ($hint === null) {
+            return null;
         }
-        $minNextDelayMs = $hints['minNextDelayMs'];
-        $notBeforeMs = $hints['notBeforeUnixMs'];
-        $usedKeys = $hints['usedKeys'];
-
-        // 4) Decide whether to propagate HTTP status. (Only if >= 400.)
-        $statusCode = $response->getStatusCode();
-        $statusOut = ($statusCode >= 400) ? $statusCode : null;
-
-        // 5) Build a slim header echo containing only keys that influenced the outcome.
-        $headersOut = [];
-        foreach ($usedKeys as $key) {
-            if (isset($headers[$key])) {
-                $headersOut[$key] = $headers[$key]; // already a single string
-            }
-        }
-
-        // 6) Tag and return metadata.
-        $tags = ['RATE_LIMITED'];
-        $ctxPatch = []; // keep empty unless you want to surface more context
+        [$minNextDelayMs, $notBeforeUnixMs, $key] = $hint;
 
         return new FailureMetadata(
-            $statusOut,
-            $tags,
-            $ctxPatch,
+            $status >= 400 && $status <= 599 ? $status : null,
+            self::canSayRateLimited($status) ? [FailureToken::RATE_LIMITED] : [],
+            [],
             $minNextDelayMs,
-            $notBeforeMs,
-            $headersOut
+            $notBeforeUnixMs,
+            [$key => [$headers[$key]]],
+            fromResponse: true,
         );
     }
 
-    /**
-     * Try to get a PSR-7 response from a throwable via getResponse().
-     */
-    private function extractResponse(\Throwable $e): ?\Psr\Http\Message\ResponseInterface
+    /** A status a server uses to say "rate limited": 403 (GitHub), 408, 429 or 5xx. */
+    private static function canSayRateLimited(int $status): bool
     {
-        if (!method_exists($e, 'getResponse')) {
-            return null;
-        }
-        try {
-            /** @var mixed $resp */
-            $resp = $e->getResponse();
-
-            return ($resp instanceof \Psr\Http\Message\ResponseInterface) ? $resp : null;
-        } catch (\Throwable $_) {
-            return null;
-        }
+        return $status === 403 || $status === 408 || $status === 429 || ($status >= 500 && $status <= 599);
     }
 
     /**
-     * Normalize PSR-7 headers to: lowercased-name => first string value.
-     * Examples:
-     *   ['Retry-After' => ['1']]        -> ['retry-after' => '1']
-     *   ['X-RateLimit-Reset' => [1234]] -> ['x-ratelimit-reset' => '1234']
+     * RateLimit-Remaining or X-RateLimit-Remaining is 0: the limit has been hit, so a reset
+     * header on this response is a wait (GitHub's 403 with X-RateLimit-Remaining: 0).
+     *
+     * @param array<string, string> $headers
      */
-    private function normalizeHeaders(array $psrHeaders): array
+    private static function quotaExhausted(array $headers): bool
     {
-        $out = [];
-        foreach ($psrHeaders as $name => $values) {
-            $lower = strtolower((string)$name);
-            if (is_array($values) && $values !== []) {
-                $first = (string)reset($values);
-            } else {
-                $first = is_scalar($values) ? (string)$values : '';
-            }
-            if ($first !== '') {
-                $out[$lower] = trim($first);
+        foreach (['ratelimit-remaining', 'x-ratelimit-remaining'] as $k) {
+            if (isset($headers[$k]) && is_numeric($headers[$k]) && (float) $headers[$k] <= 0.0) {
+                return true;
             }
         }
+        return false;
+    }
 
+    /**
+     * @param array<string, list<string>> $headers
+     * @return array<string, string> lower-cased name => first non-empty value, trimmed
+     */
+    private static function firstValues(array $headers): array
+    {
+        $out = [];
+        foreach ($headers as $name => $values) {
+            $first = trim((string) ($values[0] ?? ''));
+            if ($first !== '') {
+                $out[$name] = $first;
+            }
+        }
         return $out;
     }
 
     /**
-     * Look for common rate-limit headers and compute either:
-     *   - 'minNextDelayMs' (a delta to wait), or
-     *   - 'notBeforeUnixMs' (absolute UNIX epoch ms when to retry),
-     * plus which header keys were used (for echoing back).
-     *
-     * Recognized (case-insensitive, examples of values):
-     *   - retry-after: "2" (seconds) OR "Wed, 21 Oct 2015 07:28:00 GMT" (HTTP-date)
-     *   - ratelimit-reset-after / x-ratelimit-reset-after: "5" (delta seconds)
-     *   - ratelimit-reset / x-ratelimit-reset: "1717000000" (epoch seconds) or "1717000000123" (epoch ms)
-     *   - x-ratelimit-reset-ms: "1717000000123" (epoch ms)
+     * @param array<string, string> $headers
+     * @return array{?int, ?int, string}|null [minNextDelayMs, notBeforeUnixMs, header used]
      */
-    private function computeBackoffFromHeaders(array $headers): ?array
+    private static function retryAfter(array $headers): ?array
     {
-        // 1) Retry-After (delta seconds OR HTTP-date)
-        if (isset($headers['retry-after'])) {
-            $raw = $headers['retry-after'];
-            // numeric => seconds
-            if ($this->isNumericLike($raw)) {
-                $sec = (float)$raw;
-                $ms = (int)max(0, round($sec * 1000.0));
-
-                return ['minNextDelayMs' => $ms, 'notBeforeUnixMs' => null, 'usedKeys' => ['retry-after']];
-            }
-            // HTTP-date => absolute epoch ms
-            $ts = strtotime($raw);
-            if ($ts !== false) {
-                return ['minNextDelayMs' => null, 'notBeforeUnixMs' => $ts * 1000, 'usedKeys' => ['retry-after']];
-            }
-            // Unrecognized value — ignore and continue to other headers.
+        $raw = $headers['retry-after'] ?? null;
+        if ($raw === null) {
+            return null;
         }
+        if (is_numeric($raw)) {
+            return [HeaderWaits::secondsToMs((float) $raw), null, 'retry-after'];
+        }
+        $at = self::httpDateMs($raw);
+        return $at === null ? null : [null, $at, 'retry-after'];
+    }
 
-        // 2) *-Reset-After (delta seconds)
+    /**
+     * @param array<string, string> $headers
+     * @return array{?int, ?int, string}|null
+     */
+    private static function resetHeaders(array $headers): ?array
+    {
         foreach (['ratelimit-reset-after', 'x-ratelimit-reset-after'] as $k) {
-            if (isset($headers[$k]) && $this->isNumericLike($headers[$k])) {
-                $sec = (float)$headers[$k];
-                $ms = (int)max(0, round($sec * 1000.0));
-
-                return ['minNextDelayMs' => $ms, 'notBeforeUnixMs' => null, 'usedKeys' => [$k]];
+            if (isset($headers[$k]) && is_numeric($headers[$k])) {
+                return [HeaderWaits::secondsToMs((float) $headers[$k]), null, $k];
             }
         }
 
-        // 3) *-Reset (absolute timestamp)
-        foreach (['x-ratelimit-reset-ms'] as $k) { // explicit milliseconds
-            if (isset($headers[$k]) && $this->isNumericLike($headers[$k])) {
-                $ms = (int)$headers[$k];
-                if ($ms > 0) {
-                    return ['minNextDelayMs' => null, 'notBeforeUnixMs' => $ms, 'usedKeys' => [$k]];
-                }
+        $k = 'x-ratelimit-reset-ms';
+        if (isset($headers[$k]) && is_numeric($headers[$k])) {
+            $at = HeaderWaits::epochMs((float) $headers[$k]);
+            if ($at !== null) {
+                return [null, $at, $k];
             }
         }
+
         foreach (['ratelimit-reset', 'x-ratelimit-reset'] as $k) {
-            if (isset($headers[$k]) && $this->isNumericLike($headers[$k])) {
-                $num = (float)$headers[$k];
-                if ($num <= 0) {
-                    continue;
-                }
-                // The IETF RateLimit fields send delta seconds; older X-RateLimit-Reset headers
-                // send an epoch time in seconds or ms. Below 10^9 (2001 as an epoch) is a delta.
-                if ($num < 1e9) {
-                    return ['minNextDelayMs' => (int)round($num * 1000.0), 'notBeforeUnixMs' => null, 'usedKeys' => [$k]];
-                }
-                $ms = ($num >= 1e12) ? (int)$num : (int)round($num * 1000.0);
-
-                return ['minNextDelayMs' => null, 'notBeforeUnixMs' => $ms, 'usedKeys' => [$k]];
+            if (!isset($headers[$k]) || !is_numeric($headers[$k])) {
+                continue;
             }
+            $num = (float) $headers[$k];
+            if (is_nan($num) || $num <= 0.0) {
+                continue;
+            }
+            // The IETF RateLimit fields send delta seconds; older X-RateLimit-Reset headers
+            // send an epoch time in seconds or ms. Below 10^9 (2001 as an epoch) is a delta.
+            if ($num < 1e9) {
+                return [HeaderWaits::secondsToMs($num), null, $k];
+            }
+            return [null, HeaderWaits::epochMs($num >= 1e12 ? $num : $num * 1000.0), $k];
         }
 
-        // Nothing recognized
         return null;
     }
 
-    /** Numeric-like strings: "2", "2.5", "002". */
-    private function isNumericLike(string $s): bool
+    /** An HTTP date as epoch ms, or null when $raw is not one. */
+    private static function httpDateMs(string $raw): ?int
     {
-        // ctype_digit covers integers; fallback to is_numeric for floats
-        return $s !== '' && (ctype_digit($s) || is_numeric($s));
+        $utc = new \DateTimeZone('UTC');
+        foreach (self::DATE_FORMATS as $format) {
+            $date = \DateTimeImmutable::createFromFormat('!' . $format, $raw, $utc);
+            if ($date !== false) {
+                return HeaderWaits::epochMs($date->getTimestamp() * 1000.0);
+            }
+        }
+        // 2.x read any strtotime() string; keep the date-shaped ones ("... +0000", "... UTC").
+        if (preg_match('~^[A-Za-z]{3},\s+\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2}(\s+[A-Za-z0-9+:-]{1,6})?$~', $raw)) {
+            $ts = strtotime($raw);
+            if ($ts !== false) {
+                return HeaderWaits::epochMs($ts * 1000.0);
+            }
+        }
+        return null;
     }
 }
