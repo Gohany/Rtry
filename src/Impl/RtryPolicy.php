@@ -258,13 +258,21 @@ final class RtryPolicy implements RtryPolicyInterface
         return $this;
     }
 
+    /**
+     * The delay before $attemptNumber: the nominal delay, capped, jittered, and capped again
+     * (plus/minus jitter can land above the cap). A cap of 0 or less means no cap.
+     */
     public function nextDelayMs(?int $attemptNumber = null): int
     {
+        $cap = $this->capMs();
         $delay = $this->generateNominalDeplayMs($attemptNumber);
+        if ($cap > 0) {
+            $delay = min($delay, $cap);
+        }
         if ($this->jitter() !== null) {
             $delay = $this->jitter()->apply($delay, $this->seed);
         }
-        return min($delay, $this->capMs());
+        return $cap > 0 ? min($delay, $cap) : $delay;
     }
 
     public function setSeed(?int $seed): self
@@ -283,9 +291,8 @@ final class RtryPolicy implements RtryPolicyInterface
         $attemptNumber = $attemptNumber === null ? $this->cursor++ : max(1, $attemptNumber);
         switch ($this->backoffMode()) {
             case 'lin':
-                $inc = $this->incrementMs ?? 0;
-                $val = max(1, $attemptNumber - 1) * $inc;
-                return $val;
+                // d, 2d, 3d, ... before attempts 2, 3, 4, ...
+                return max(1, $attemptNumber - 1) * max(0, $this->delayMs ?? 0);
 
             case 'seq':
                 if ($this->sequence() === null) {
@@ -296,12 +303,12 @@ final class RtryPolicy implements RtryPolicyInterface
 
             case 'exp':
             default:
-                // Exponential backoff: startAfter * (base ^ (attempt-1)) - startAfter (or similar).
-                // Keeping behavior consistent with prior implementation expectations.
-                $base = $this->exponentialBase();
-                $n = max(0, $attemptNumber - 1);
-                $delay = (int) round($this->startAfterMs * (pow($base, $n - 1)));
-                return max(0, $delay);
+                // d * b^(n-2) before attempt n (d, d*b, d*b^2, ...). A spec without d= keeps
+                // the 1.0.x behaviour of growing from sa= instead.
+                $initial = $this->delayMs ?? $this->startAfterMs;
+                $base = $this->exponentialBase() ?? 2.0;
+                $delay = $initial * pow($base, max(0, $attemptNumber - 2));
+                return $delay >= PHP_INT_MAX ? PHP_INT_MAX : max(0, (int) round($delay));
         }
     }
 

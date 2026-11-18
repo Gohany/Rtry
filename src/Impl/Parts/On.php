@@ -39,18 +39,35 @@ final class On extends Part implements PartInterface, GeneratesRulesInterface
 
     public function applyToPolicy(RtryPolicyInterface $policy): RtryPolicyInterface
     {
+        return $policy->setRetryOnTokens($this->retryTokens());
+    }
+
+    /**
+     * The tokens a decider matches on: "default"/"standard" (or an empty on=) expand to
+     * FailureToken::defaults(), a numeric token becomes an int so it matches the status code,
+     * and the rest are upper-cased (as OnTokensDecider compares them) and de-duplicated.
+     *
+     * @return array<int,int|string>
+     */
+    private function retryTokens(): array
+    {
         $tokens = [];
-        if (empty($tokens)) {
-            $tokens[] = 'default';
-        } else {
-            foreach ($tokens as $token) {
-                if ($this->isDefaultTag($token)) {
-                    $tokens = array_merge($tokens, FailureToken::defaults());
-                    break;
-                }
+        $source = $this->tokens === [] ? ['default'] : $this->tokens;
+        foreach ($source as $token) {
+            if ($this->isDefaultTag($token)) {
+                $tokens = array_merge($tokens, FailureToken::defaults());
+                continue;
+            }
+            $tokens[] = ctype_digit($token) ? (int) $token : strtoupper($token);
+        }
+
+        $unique = [];
+        foreach ($tokens as $token) {
+            if (!in_array($token, $unique, true)) {
+                $unique[] = $token;
             }
         }
-        return $policy->setRetryOnTokens($tokens);
+        return $unique;
     }
 
     public function addRulesToClassifier(?RuleBasedClassifierInterface $classifier): RuleBasedClassifierInterface

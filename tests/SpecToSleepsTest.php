@@ -233,7 +233,8 @@ final class SpecToSleepsTest extends TestCase
         $decider = new OnTokensDecider([]);
         (new RtryPolicyFactory())->fromSpec('rtry:a=3;d=10;on=5xx,429,standard', $decider);
 
-        self::assertSame(array_merge(['5XX', 429], FailureToken::defaults()), $decider->getTokens());
+        self::assertSame(['5XX', 429, 'ETIMEDOUT', 'NETWORK_ERROR', 'ECONNRESET', 'ECONNREFUSED', 'DEADLOCK', 'RATE_LIMITED'], $decider->getTokens());
+        self::assertSame(['5XX', 'ETIMEDOUT', 'NETWORK_ERROR', 'ECONNRESET', 'ECONNREFUSED', 'DEADLOCK', 'RATE_LIMITED'], FailureToken::defaults());
     }
 
     public function testACallerSuppliedDeciderStillWinsOverOn(): void
@@ -255,7 +256,7 @@ final class SpecToSleepsTest extends TestCase
     /** on=429 adds the rate-limit rule it always generated; it now reaches the policy, so Retry-After is waited out. */
     public function testOn429WaitsOutRetryAfter(): void
     {
-        $response = $this->createMock(ResponseInterface::class);
+        $response = $this->createStub(ResponseInterface::class);
         $response->method('getStatusCode')->willReturn(429);
         $response->method('getHeaders')->willReturn(['Retry-After' => ['2']]);
 
