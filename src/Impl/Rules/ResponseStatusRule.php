@@ -4,32 +4,31 @@ namespace Gohany\Rtry\Impl\Rules;
 
 use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
 use Gohany\Rtry\Contracts\RuleInterface;
+use Gohany\Rtry\Impl\ErrorResponseLocator;
 use Gohany\Rtry\Impl\FailureMetadata;
-use Gohany\Rtry\Impl\Psr7ErrorResponseReader;
 
 /**
- * The status of the HTTP response an error carries, found by an ErrorResponseReaderInterface
- * (PSR-7 getResponse() by default).
+ * The status of the HTTP response an error carries, wherever it sits on the error: see
+ * ErrorResponseLocator. A reader passed here is tried first, then the default reading.
+ * A response whose status is above 599 is still a response: no status, but no transport
+ * tags either.
  */
 final class ResponseStatusRule implements RuleInterface
 {
-    private readonly ErrorResponseReaderInterface $reader;
+    private readonly ErrorResponseLocator $locator;
 
     public function __construct(?ErrorResponseReaderInterface $reader = null)
     {
-        $this->reader = $reader ?? new Psr7ErrorResponseReader();
+        $this->locator = ErrorResponseLocator::wrap($reader);
     }
 
     public function apply(\Throwable $e): ?FailureMetadata
     {
-        try {
-            $response = $this->reader->read($e);
-        } catch (\Throwable) {
-            return null; // a reader that throws found nothing
-        }
-        if ($response === null || $response->statusCode < 100 || $response->statusCode > 599) {
+        $response = $this->locator->read($e);
+        if ($response === null) {
             return null;
         }
-        return new FailureMetadata($response->statusCode);
+        $status = $response->statusCode;
+        return new FailureMetadata($status >= 100 && $status <= 599 ? $status : null, fromResponse: true);
     }
 }

@@ -195,7 +195,7 @@ final class RrtyRulesTest extends TestCase
         $this->assertInstanceOf(FailureMetadataInterface::class, $m);
         $this->assertNull($m->getStatusCode(), 'status should be null when < 400');
         $this->assertGreaterThanOrEqual(2000, (int)$m->getMinNextDelayMs());
-        $this->assertContains('RATE_LIMITED', $m->getTags());
+        $this->assertNotContains('RATE_LIMITED', $m->getTags(), 'only a 429 or a 503 is rate limited');
     }
 
     public function test_rate_limit_rule_returns_null_when_no_headers_or_response(): void

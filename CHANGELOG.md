@@ -2,36 +2,76 @@
 
 ## Unreleased
 
-Three behaviour changes and one additive seam; no change to the gohany/retry interfaces.
+Planned as 2.3.0. No change to the gohany/retry interfaces and no method removed; every
+constructor and method change is an optional argument. Some behaviour changes on purpose. Each
+is a fix for a failure that retried when it should not have, or the reverse. They are listed
+under Changed so you can check them against your specs.
 
 ### Changed
 
-- **An HTTP error status decides alone.** When an error carries a status from 400 to 599 (from
-  a rule, or its exception code), the classifier no longer adds tags from its message. A 404
-  whose URL contains "timeout" used to be tagged `ETIMEDOUT` and retried under `on=default`;
-  it now runs once. Errors without an HTTP status keep their tags, including errno-coded
-  transport errors such as `Connection refused` with code 111. Tags from your own rules are
-  unchanged. A spec that relied on a message tag to retry a 5xx (say `on=ETIMEDOUT` for a
-  504) now needs the status (`on=504` or `on=5xx`).
-- **`RATE_LIMITED` only on a 429 or a 503.** `RateLimitBackoffRule` still turns rate-limit
-  headers into a delay on any response, but tags `RATE_LIMITED` only on a 429, a 503 or a
-  response below 400. An API that sends `X-RateLimit-Reset` on every response no longer makes
-  its 404s and 422s retryable.
+- **A status read from an HTTP response decides, wherever it sits on the error.** Rtry looks
+  along the `getPrevious()` chain for a response (`getResponse()`, PSR-7 or Symfony-shaped)
+  or a status accessor (`getStatusCode()`, `getHttpStatus()`, `getHttpStatusCode()`). A
+  retryable status (408, 429, 5xx) keeps the error's transport tags, as in 2.2. Any other
+  (a 4xx, a 1xx-3xx, a status above 599) gets no tags. A wrapped 404 whose URL says
+  "timeout", or a 422 whose body says "card refused", used to retry under `on=default`; it
+  now runs once.
+- **Tags need transport evidence.** `ETIMEDOUT`, `ECONNREFUSED` and their siblings come
+  from transport types (PSR-18 `NetworkExceptionInterface`, Symfony HttpClient
+  `TransportExceptionInterface`), a cURL error number, or a specific phrase ("connection
+  refused", "timed out", "connection reset", "timeout waiting", ...), on the error or anything
+  in its chain. They no longer come from a bare "timeout" or "refused". A `LogicException` or
+  an `\Error` never gets tags from its message. `InvalidArgumentException('timeout must be a
+  positive integer')` and `DomainException('Payment refused by issuer')` used to retry; they
+  now run once. If you relied on a word match, add a `MessageRegexRule` or an `InstanceOfRule`.
+- **An exception code is still a status for `on`, as in 2.x, but it never silences tags.**
+  `new RuntimeException('421 4.4.2 Connection timed out', 421)` (SMTP) and a deadlock coded
+  409 keep `ETIMEDOUT` and `DEADLOCK` and retry under `on=default`.
+- **Rate-limit reset headers only on a 429 or a 503.** `RateLimit-Reset(-After)` and
+  `X-RateLimit-Reset(-After|-Ms)` used to set a wait on any response. Many APIs send them
+  on every response, so a 502 could wait out an hour. They now set a wait only on a 429 or a
+  503, and `RATE_LIMITED` is tagged only there, never below 400. `Retry-After` is still honoured
+  on any status.
+- **A server's wait is jittered above, never below.** In-process (`Retry`), and for durable
+  callers that pass the policy to `RtryAttemptOutcome::fromError()`, a `Retry-After` gets the
+  policy's jitter window for that attempt added on top. Callers told "2 s" no longer return in
+  the same millisecond. `j=0` waits exactly what the server said. The spread never crosses
+  `dl`. `RtryScheduler::next()` itself is unchanged (gohany/retry SPEC 5.11 step 5).
+- **A server's wait over a day gives up** with `DeadlineExceeded` instead of sleeping
+  (`RtryScheduler::MAX_HEADER_WAIT_MS`, or the scheduler's new optional `$maxHeaderWaitMs`
+  argument). Waits under that are still honoured above `cap`, as the SPEC requires.
 - **No give-up is logged at `error`.** A failure the policy does not retry and its give-up are
   logged at `debug` (`retry.failure` was `warning`, `retry.give_up` was `error`). Any other
-  give-up (attempts, deadline, budget, circuit) is logged at `warning`, not `error`. Still the
-  exception's class, never its message.
+  give-up (attempts, deadline, budget, circuit) is logged at `warning`, not `error`. If you
+  alert on `retry.give_up` at `error`, alert on `warning` or use `setOnGiveUpHook()`.
+
+### Fixed
+
+- A response header can no longer replace the operation's error. `Retry-After:
+  @9223372036854776`, `9223372036854770`, `99999999999999999999` or `1e400`, and the
+  same in the `RateLimit-Reset*` headers, used to throw a `TypeError` or (on PHP 8.5) an
+  `E_WARNING` out of `try()`, or wrap to a negative wait. Values are parsed without
+  float-to-int casts: absurd waits give up, unreadable ones are ignored. "tomorrow" and
+  "next year" are no longer HTTP dates. The IMF-fixdate, RFC 850 and asctime formats are
+  read, and so is a date-shaped string with a zone such as `+0000`.
+- A header value that is a nested list no longer raises "Array to string conversion".
+- An anonymous exception class is logged as `RuntimeException@anonymous`, without the NUL
+  byte and file path PHP appends to its name.
 
 ### Added
 
-- `Contracts\ErrorResponseReaderInterface` and `ErrorResponse` (a status and lower-cased
-  headers): how the classifier finds the HTTP response on an error. `Psr7ErrorResponseReader`
-  is the default. Pass your own to `RuleBasedFailureClassifier::default($reader)` so a client
-  that is not PSR-7 (Symfony HttpClient) has its `Retry-After` honoured; README, "Clients that
-  are not PSR-7".
-- `Rules\ResponseStatusRule`: the status from a reader. `default()` uses it in place of
-  `MethodStatusRule(['getResponse'])`, with the same result for PSR-7 responses.
-  `RateLimitBackoffRule` takes an optional reader too.
+- `ErrorResponseLocator`: finds the response on an error, wherever it sits, and reads each
+  error once for all the rules that share it. `Contracts\ErrorResponseReaderInterface` and
+  `ErrorResponse` (a status and lower-cased headers) let you add a reader for a client that
+  keeps its response somewhere else. Pass it to `RuleBasedFailureClassifier::default($reader)`.
+  It is tried first, and the default reading still follows, so PSR-7 errors keep working
+  next to it. README, "Responses Rtry cannot find".
+- `Rules\ResponseStatusRule`: the status from the locator. `default()` keeps
+  `MethodStatusRule(['getResponse'])` first, as in 2.x, so `hasRuleOfType(MethodStatusRule::class)`
+  is still true.
+- `FailureMetadata::isFromResponse()` and its optional `$fromResponse` constructor argument,
+  `RtryScheduler::headerSpreadMs()`, and `RtryAttemptOutcome::fromError()`'s optional
+  `$policy`, `$failedAttempt` and `$random` arguments.
 
 ## 2.2.0 — 2026-11-18
 

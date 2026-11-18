@@ -35,7 +35,9 @@ final class RuleBasedFailureClassifierTest extends TestCase
         $c->addRule(new TestRule($m1));
         $c->addRule(new TestRule($m2));
 
-        // The rules give an HTTP status, so the message's words add no tags (status decides)
+        // The rules' statuses were not read from a response, so the message still adds tags,
+        // as in 2.x; but only from transport phrases: "connection reset" counts, a bare
+        // "timeout" does not.
         $e = new \RuntimeException('Operation timeout due to connection reset');
 
         // Act
@@ -50,8 +52,8 @@ final class RuleBasedFailureClassifierTest extends TestCase
         $this->assertContains('A', $tags);
         $this->assertContains('B', $tags);
         $this->assertContains('C', $tags);
-        $this->assertNotContains('ETIMEDOUT', $tags, 'an HTTP status is judged alone');
-        $this->assertNotContains('ECONNRESET', $tags, 'an HTTP status is judged alone');
+        $this->assertContains('ECONNRESET', $tags);
+        $this->assertNotContains('ETIMEDOUT', $tags, 'a bare "timeout" is not transport evidence');
 
         $this->assertSame(['x' => '1', 'y' => '2', 'z' => '3'],
             $meta->getContextPatch(),
@@ -83,7 +85,7 @@ final class RuleBasedFailureClassifierTest extends TestCase
 
         // Assert
         $this->assertSame(502, $meta->getStatusCode());
-        $this->assertSame([], $meta->getTags(), 'a 502 is judged by its status, not its message');
+        $this->assertContains('NETWORK_ERROR', $meta->getTags(), 'a code is not a response: the message still counts');
     }
 
     public function test_rule_returning_array_of_metas_is_supported_and_merged(): void
@@ -96,7 +98,7 @@ final class RuleBasedFailureClassifierTest extends TestCase
         $c->addRule(new TestRule($m1));
         $c->addRule(new TestRule($m2));
 
-        $e = new \RuntimeException('timeout'); // no ETIMEDOUT: the rules give an HTTP status
+        $e = new \RuntimeException('timeout'); // no ETIMEDOUT: a bare "timeout" is not transport evidence
 
         // Act
         $meta = $c->classify($e);

@@ -37,7 +37,7 @@ final class MethodStatusRule implements RuleInterface
                 // If response-like with getStatusCode()
                 if ($val instanceof ResponseInterface) {
                     $code = (int) $val->getStatusCode();
-                    return new FailureMetadata($code, $this->tags);
+                    return new FailureMetadata($code, $this->tags, fromResponse: true);
                 }
 
                 // If method returns an int that looks like an HTTP status

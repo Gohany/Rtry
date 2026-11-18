@@ -7,11 +7,62 @@ use Gohany\Rtry\Contracts\FailureClassifierInterface;
 use Gohany\Rtry\Contracts\FailureMetadataInterface;
 use Gohany\Rtry\Contracts\RuleBasedClassifierInterface;
 use Gohany\Rtry\Contracts\RuleInterface;
+use Gohany\Rtry\Impl\Rules\MethodStatusRule;
 use Gohany\Rtry\Impl\Rules\RateLimitBackoffRule;
 use Gohany\Rtry\Impl\Rules\ResponseStatusRule;
 
+/**
+ * Turns a thrown error into a status and tags (README, "What retries"):
+ *
+ * - A status read from an HTTP response the error carries, at any depth of its getPrevious()
+ *   chain (ErrorResponseLocator), decides. A retryable one (408, 429, 5xx) also gets the
+ *   error's transport tags; any other (a 404, a 422, a 302, a 999) gets none, so the words in
+ *   a 404's URL never make it retryable.
+ * - Otherwise the exception code, when it is 100 to 599, is the status for on= matching, as in
+ *   2.x. It never silences tags: SMTP's 421 and a driver's 409 are codes from that range.
+ * - Tags come only from transport and deadlock evidence: transport types (PSR-18
+ *   NetworkExceptionInterface, Symfony HttpClient TransportExceptionInterface), a cURL error
+ *   number, deadlock SQLSTATEs and vendor codes, and specific phrases ("connection refused",
+ *   "timed out", "deadlock found"), never a bare word such as "timeout" or "refused". A
+ *   LogicException or an \Error (TypeError, ValueError) is a bug or a validation error: its
+ *   message is never read for tags.
+ * - Tags from rules you add are kept whatever the status.
+ */
 final class RuleBasedFailureClassifier implements FailureClassifierInterface, RuleBasedClassifierInterface
 {
+    private const MAX_DEPTH = 16;
+
+    /** Phrases that name a timeout. Not "timeout" alone: "timeout must be positive" is not one. */
+    private const TIMEOUT_PHRASES = [
+        'timed out', 'timeout was reached', 'timeout reached', 'timeout exceeded', 'timeout expired',
+        'timeout waiting', 'connection timeout', 'read timeout', 'request timeout', 'gateway timeout',
+        'socket timeout',
+    ];
+    private const RESET_PHRASES = ['connection reset', 'connection was reset'];
+    /** Not "refused" alone: "payment refused" and "consent refused" are not transport errors. */
+    private const REFUSED_PHRASES = ['connection refused', 'actively refused'];
+    private const NETWORK_PHRASES = ['network error', 'network timeout', 'network is unreachable', 'host unreachable', 'no route to host'];
+    private const DEADLOCK_PHRASES = [
+        'deadlock',                    // "deadlock detected/found/victim"
+        'lock wait timeout exceeded',  // MySQL InnoDB
+        'database is locked',          // SQLite
+        'could not serialize access',  // PostgreSQL
+        'serialization failure',       // SQL standard / PostgreSQL
+    ];
+    /** cURL error numbers ("cURL error 28: ...") that mean the request never got a response. */
+    private const CURL_ERRORS = [
+        7 => FailureToken::NETWORK_ERROR,   // could not connect
+        28 => FailureToken::ETIMEDOUT,      // operation timed out
+        35 => FailureToken::NETWORK_ERROR,  // TLS handshake failed
+        52 => FailureToken::NETWORK_ERROR,  // empty reply
+        55 => FailureToken::NETWORK_ERROR,  // send failure
+        56 => FailureToken::NETWORK_ERROR,  // receive failure
+    ];
+    private const TRANSPORT_TYPES = [
+        'Psr\\Http\\Client\\NetworkExceptionInterface',
+        'Symfony\\Contracts\\HttpClient\\Exception\\TransportExceptionInterface',
+    ];
+
     /** @var array<int,RuleInterface> */
     private array $rules = [];
 
@@ -26,12 +77,19 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
 
     /**
      * What every policy gets unless a classifier is injected: the status of the HTTP response
-     * on the error, and Retry-After / RateLimit-Reset from its headers. The response is a PSR-7
-     * one from getResponse() unless $reader finds it another way (Symfony HttpClient, say).
+     * on the error, and Retry-After / RateLimit-Reset from its headers, found anywhere on the
+     * error by an ErrorResponseLocator. $reader is tried first, for a client that keeps its
+     * response somewhere the locator does not look; the default reading still follows.
+     * MethodStatusRule(['getResponse']) stays first, as in 2.x.
      */
     public static function default(?ErrorResponseReaderInterface $reader = null): self
     {
-        return new self([new ResponseStatusRule($reader), new RateLimitBackoffRule($reader)]);
+        $locator = ErrorResponseLocator::wrap($reader);
+        return new self([
+            new MethodStatusRule(['getResponse']),
+            new ResponseStatusRule($locator),
+            new RateLimitBackoffRule($locator),
+        ]);
     }
 
     public function classify(\Throwable $e): FailureMetadataInterface
@@ -44,9 +102,16 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
         $minNextDelayMs = null;
         $notBeforeUnixMs = null;
         $headers = [];
+        $fromResponse = false;
+        $responseStatus = null;
 
         if ($metas !== null) {
             foreach ($metas as $m) {
+                if ($m instanceof FailureMetadata && $m->isFromResponse()) {
+                    $fromResponse = true;
+                    $responseStatus = $m->getStatusCode() ?? $responseStatus;
+                }
+
                 // Most recent non-null status code wins
                 $s = $m->getStatusCode();
                 if ($s !== null) {
@@ -75,21 +140,25 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
             }
         }
 
-        // Fallbacks
-        if ($status === null) {
-            $status = $this->extractStatusCode($e);
-        }
-
-        // An error carrying an HTTP error status is judged by that status alone: a 404 whose
-        // URL says "timeout" is still a 404. Only an error without one (a transport error; an
-        // errno such as 111 is not an HTTP status) gets tags from its message and type. Tags
-        // from the rules stay: a caller's own rule says what it means.
-        if ($status === null || $status < 400 || $status > 599) {
+        if ($fromResponse) {
+            // A status from a response decides. Only a retryable one also gets transport tags
+            // (2.x callers match a timed-out 504 with on=ETIMEDOUT).
+            if ($responseStatus !== null && self::isRetryableStatus($responseStatus)) {
+                $tags = array_merge($tags, $this->collectTags($e));
+            }
+        } else {
+            // No response: the code is the status for on=, as in 2.x, but never proof of HTTP.
+            $status ??= $this->extractStatusCode($e);
             $tags = array_merge($tags, $this->collectTags($e));
         }
         $tags = array_values(array_unique($tags));
 
-        return new FailureMetadata($status, $tags, $ctxPatch, $minNextDelayMs, $notBeforeUnixMs, $headers);
+        return new FailureMetadata($status, $tags, $ctxPatch, $minNextDelayMs, $notBeforeUnixMs, $headers, $fromResponse);
+    }
+
+    private static function isRetryableStatus(int $status): bool
+    {
+        return $status === 408 || $status === 429 || ($status >= 500 && $status <= 599);
     }
 
     /**
@@ -147,7 +216,9 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
                 $base[$key] = [];
             }
             foreach ((array) $values as $v) {
-                $base[$key][] = $v;
+                if (is_scalar($v) || $v instanceof \Stringable) {
+                    $base[$key][] = (string) $v;
+                }
             }
             // Dedupe while preserving order
             $base[$key] = array_values(array_unique($base[$key]));
@@ -167,92 +238,70 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
     }
 
     /**
+     * Transport and deadlock tags from the error and its getPrevious() chain.
+     *
      * @return array<int,string>
      */
     private function collectTags(\Throwable $e): array
     {
         $tags = [];
-        $messageLower = strtolower((string) $e->getMessage());
-
-        if ($this->containsAny($messageLower, ['timeout', 'timed out'])) {
-            $tags[] = FailureToken::ETIMEDOUT;
-        }
-
-        if ($this->containsAny($messageLower, ['connection reset'])) {
-            $tags[] = FailureToken::ECONNRESET;
-        }
-
-        if ($this->containsAny($messageLower, ['refused'])) {
-            $tags[] = FailureToken::ECONNREFUSED;
-        }
-
-        if ($this->isNetworkError($e, $messageLower)) {
-            $tags[] = FailureToken::NETWORK_ERROR;
-        }
-
-        if ($this->isDeadlock($e)) {
-            $tags[] = FailureToken::DEADLOCK;
-        }
-
-        return $tags;
-    }
-
-    private function isNetworkError(\Throwable $e, string $messageLower): bool
-    {
-        if (interface_exists(\Psr\Http\Client\NetworkExceptionInterface::class)) {
-            for ($t = $e; $t !== null; $t = $t->getPrevious()) {
-                if ($t instanceof \Psr\Http\Client\NetworkExceptionInterface) {
-                    return true;
+        for ($t = $e, $depth = 0; $t !== null && $depth < self::MAX_DEPTH; $t = $t->getPrevious(), $depth++) {
+            foreach (self::TRANSPORT_TYPES as $type) {
+                if ($t instanceof $type) {
+                    $tags[] = FailureToken::NETWORK_ERROR;
                 }
+            }
+            if ($this->isDeadlockType($t)) {
+                $tags[] = FailureToken::DEADLOCK;
+            }
+
+            // A LogicException or an \Error is a bug or a validation error, whatever it says.
+            if ($t instanceof \LogicException || $t instanceof \Error) {
+                continue;
+            }
+            $message = strtolower((string) $t->getMessage());
+            if ($this->containsAny($message, self::TIMEOUT_PHRASES)) {
+                $tags[] = FailureToken::ETIMEDOUT;
+            }
+            if ($this->containsAny($message, self::RESET_PHRASES)) {
+                $tags[] = FailureToken::ECONNRESET;
+            }
+            if ($this->containsAny($message, self::REFUSED_PHRASES)) {
+                $tags[] = FailureToken::ECONNREFUSED;
+            }
+            if ($this->containsAny($message, self::NETWORK_PHRASES)) {
+                $tags[] = FailureToken::NETWORK_ERROR;
+            }
+            if (preg_match('~\bcurl error (\d+)~', $message, $m) && isset(self::CURL_ERRORS[(int) $m[1]])) {
+                $tags[] = self::CURL_ERRORS[(int) $m[1]];
+            }
+            if ($this->containsAny($message, self::DEADLOCK_PHRASES)) {
+                $tags[] = FailureToken::DEADLOCK;
             }
         }
 
-        return $this->containsAny($messageLower, [
-            'network error',
-            'network timeout',
-            'network is unreachable',
-            'host unreachable',
-            'no route to host',
-        ]);
+        return array_values(array_unique($tags));
     }
 
-    private function isDeadlock(\Throwable $e): bool
+    private function isDeadlockType(\Throwable $t): bool
     {
-        for ($t = $e; $t !== null; $t = $t->getPrevious()) {
-            $tLower = strtolower((string) $t->getMessage());
+        if (
+            class_exists(\Doctrine\DBAL\Exception\DeadlockException::class)
+            && $t instanceof \Doctrine\DBAL\Exception\DeadlockException
+        ) {
+            return true;
+        }
 
-            // Common textual indicators across databases
-            if (
-                $this->containsAny($tLower, [
-                    'deadlock',                           // "deadlock detected/found/victim"
-                    'lock wait timeout exceeded',         // MySQL InnoDB
-                    'database is locked',                 // SQLite
-                    'could not serialize access',         // PostgreSQL
-                    'serialization failure',              // SQL standard / PostgreSQL
-                ])
-            ) {
+        // PDOException: inspect SQLSTATE and vendor codes
+        if ($t instanceof \PDOException) {
+            $sqlState = $this->extractSqlState($t);
+            if ($sqlState !== null && $this->isDeadlockSqlState($sqlState)) {
                 return true;
             }
 
-            // Doctrine DBAL specific exception (if available)
-            if (
-                class_exists(\Doctrine\DBAL\Exception\DeadlockException::class)
-                && $t instanceof \Doctrine\DBAL\Exception\DeadlockException
-            ) {
+            $vendorCode = $this->extractVendorCode($t);
+            if ($vendorCode !== null && $this->isDeadlockVendorCode($vendorCode)) {
                 return true;
-            }
-
-            // PDOException: inspect SQLSTATE and vendor codes
-            if ($t instanceof \PDOException) {
-                $sqlState = $this->extractSqlState($t);
-                if ($sqlState !== null && $this->isDeadlockSqlState($sqlState)) {
-                    return true;
-                }
-
-                $vendorCode = $this->extractVendorCode($t);
-                if ($vendorCode !== null && $this->isDeadlockVendorCode($vendorCode)) {
-                    return true;
-                }
             }
         }
 

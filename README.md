@@ -74,52 +74,63 @@ Anything else (another 4xx, a validation error, an error with no status and no t
 
 Rtry turns a thrown error into a status and tags with a `RuleBasedFailureClassifier`:
 
-- the status of a PSR-7 response returned by the error's `getResponse()` (Guzzle, and most
-  PSR-18 clients' exceptions), or else an exception code between 100 and 599;
-- `Retry-After`, `RateLimit-Reset(-After)` and `X-RateLimit-Reset(-After|-Ms)` headers on that
-  response, which set the next delay and tag a 429 or a 503 `RATE_LIMITED`;
-- `ETIMEDOUT`, `ECONNRESET`, `ECONNREFUSED` and `NETWORK_ERROR` from the message and
-  `Psr\Http\Client\NetworkExceptionInterface`;
-- `DEADLOCK` from deadlock and serialization failures (MySQL 1213/1205, SQLSTATE 40001/40P01,
-  Doctrine's `DeadlockException`).
+- **A status read from an HTTP response decides.** Rtry looks at the error and every error in
+  its `getPrevious()` chain for a response: `getResponse()` returning a PSR-7 response
+  (Guzzle, PSR-18 clients) or one with `getStatusCode()` (Symfony HttpClient, whose headers it
+  reads with `getHeaders(false)`), or a status accessor on the error itself (`getStatusCode()`
+  as in the AWS SDK, `getHttpStatus()` as in Stripe's, `getHttpStatusCode()`). A 404 wrapped
+  in a `RuntimeException('Request failed', 0, $e)` is still a 404.
+- A retryable response status (408, 429, 5xx) also gets the error's transport tags, so
+  `on=ETIMEDOUT` still matches a 504 that says it timed out. Any other response status (a 404,
+  a 422, a 302, a 999) gets no tags at all: a 404 whose URL contains "timeout", or a 422 whose
+  body says "card refused", runs once.
+- **Without a response, the exception code** from 100 to 599 is the status for `on`, as in
+  2.x, so `on=503` matches `new RuntimeException('...', 503)`. A code is not proof of HTTP
+  (SMTP's 421, a driver's 409), so it never silences the tags below.
+- **Tags come only from transport and deadlock evidence:** `ETIMEDOUT`, `ECONNRESET`,
+  `ECONNREFUSED` and `NETWORK_ERROR` from `Psr\Http\Client\NetworkExceptionInterface`,
+  Symfony HttpClient's `TransportExceptionInterface`, a cURL error number (`cURL error 28`)
+  or a specific phrase such as "connection refused", "timed out" or "connection reset", on the
+  error or any error in its chain; `DEADLOCK` from deadlock and serialization failures (MySQL
+  1213/1205, SQLSTATE 40001/40P01, Doctrine's `DeadlockException`, "Deadlock found"). A bare
+  "timeout" or "refused" is not evidence: "timeout must be a positive integer" and "Payment
+  refused by issuer" run once. A `LogicException` or an `\Error` (`TypeError`, `ValueError`)
+  never gets tags from its message: it is a bug or a validation error.
+- `Retry-After` on any response, and `RateLimit-Reset(-After)` and
+  `X-RateLimit-Reset(-After|-Ms)` on a 429 or a 503, set the next wait; a 429 or a 503 that
+  carries one is tagged `RATE_LIMITED`. Many APIs send `X-RateLimit-*` on every response, so
+  on any other status those headers mean nothing.
 
-An error carrying an HTTP error status (400 to 599) is judged by that status alone. A 404 whose
-URL contains "timeout" gets no `ETIMEDOUT`, and a 404 from an API that sends
-`X-RateLimit-Reset` on every response is not `RATE_LIMITED`: both run once. Errors without an
-HTTP status, transport errors among them (an errno code such as 111 is not one), keep the tags
-from their message and type. Tags from rules you add stay whatever the status.
+Tags from rules you add are kept whatever the status.
 
-### Clients that are not PSR-7
+### Responses Rtry cannot find
 
-The status and `Retry-After` come from an `ErrorResponseReaderInterface`. The default reads a
-PSR-7 response from `getResponse()`. For another client, write a reader and pass it to
-`RuleBasedFailureClassifier::default()`. Symfony HttpClient, for example:
+For a client that keeps its response somewhere else, write an `ErrorResponseReaderInterface`
+and pass it to `RuleBasedFailureClassifier::default()`. Rtry tries it first on each error in
+the chain, then its own reading, so PSR-7 and Symfony errors keep working alongside it.
+Laravel's HTTP client, for example, keeps the response in a property:
 
 ```php
 use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
 use Gohany\Rtry\Impl\ErrorResponse;
 use Gohany\Rtry\Impl\RtryPolicyFactory;
 use Gohany\Rtry\Impl\RuleBasedFailureClassifier;
-use Symfony\Contracts\HttpClient\Exception\HttpExceptionInterface;
 
-final class SymfonyResponseReader implements ErrorResponseReaderInterface
+final class LaravelResponseReader implements ErrorResponseReaderInterface
 {
     public function read(\Throwable $e): ?ErrorResponse
     {
-        if (!$e instanceof HttpExceptionInterface) {
+        if (!$e instanceof \Illuminate\Http\Client\RequestException) {
             return null;
         }
-        $response = $e->getResponse();
-        // false: Symfony's getHeaders() throws on a 4xx/5xx otherwise.
-        return new ErrorResponse($response->getStatusCode(), $response->getHeaders(false));
+        return new ErrorResponse($e->response->status(), $e->response->headers());
     }
 }
 
-$factory = new RtryPolicyFactory(null, RuleBasedFailureClassifier::default(new SymfonyResponseReader()));
+$factory = new RtryPolicyFactory(null, RuleBasedFailureClassifier::default(new LaravelResponseReader()));
 ```
 
-Without a reader, a Symfony error still retries on its status (its exception code), but its
-`Retry-After` goes unseen.
+A reader that throws is treated as finding nothing.
 
 Add your own rules, or pass a decider that replaces `on`:
 
@@ -141,7 +152,18 @@ $always = $factory->fromSpec('rtry:a=3;d=100', new AlwaysRetryDecider());
 ## Retry-After and deadlines
 
 With `fh=1` (the default) the next attempt waits at least as long as the server asked, even
-above `cap`. `fh=0` ignores the headers.
+above `cap` (gohany/retry SPEC 5.11). `fh=0` ignores the headers.
+
+- **Jittered above, never below.** Callers told the same `Retry-After` would otherwise return
+  in the same millisecond, so Rtry adds the policy's jitter window for that attempt on top: with
+  full jitter and a 100 ms backoff, `Retry-After: 2` waits between 2000 and 2100 ms. `j=0`
+  waits exactly what the server said. The spread never pushes a wait past `dl`.
+- **Bounded.** A wait past `dl` gives up with `DeadlineExceeded` without sleeping. So does a
+  wait longer than a day (`RtryScheduler::MAX_HEADER_WAIT_MS`; pass another ceiling to
+  `RtryScheduler`'s constructor for durable retries that should wait longer). A header asking
+  for a year, a number too large for PHP, a negative or malformed value, or a word such as
+  "tomorrow" never raises a PHP warning or a `TypeError`: absurd waits give up, unreadable
+  ones are ignored.
 
 `dl` is a budget from the start of attempt 1. When the next wait would reach it, Rtry gives up
 with `DeadlineExceeded` instead of sleeping. `t` is an advisory per-attempt timeout: PHP cannot
@@ -166,7 +188,8 @@ $policy = (new RtryPolicyFactory())->fromSpec('rtry:a=8;d=30s;cap=1h');
 $scheduler = new RtryScheduler();
 
 // $error was thrown by attempt number $job->attempts.
-$outcome = RtryAttemptOutcome::fromError($error, $policy->failureClassifier());
+// Passing the policy and attempt spreads rows told the same Retry-After above it.
+$outcome = RtryAttemptOutcome::fromError($error, $policy->failureClassifier(), null, $policy, $job->attempts);
 $decision = $scheduler->next($policy, $outcome, new RtryAttemptContext($job->attempts, $policy->attempts(), 0, 0, null));
 
 if ($decision->retry()) {
