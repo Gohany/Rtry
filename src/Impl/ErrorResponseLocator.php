@@ -2,6 +2,7 @@
 
 namespace Gohany\Rtry\Impl;
 
+use Gohany\Rtry\Contracts\ErrorResponse;
 use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
 use Psr\Http\Message\ResponseInterface;
 

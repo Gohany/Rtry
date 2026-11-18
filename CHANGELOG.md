@@ -80,8 +80,9 @@ under Changed so you can check them against your specs.
 
 - `ErrorResponseLocator`: finds the response on an error, wherever it sits, and reads each
   error once for all the rules that share it. `Contracts\ErrorResponseReaderInterface` and
-  `ErrorResponse` (a status and lower-cased headers) let you add a reader for a client that
-  keeps its response somewhere else. Pass it to `RuleBasedFailureClassifier::default($reader)`.
+  `Contracts\ErrorResponse` (a status and lower-cased headers) let you add a reader for a
+  client that keeps its response somewhere else. Pass it to
+  `RuleBasedFailureClassifier::default($reader)`.
   It is tried first, and the default reading still follows, so PSR-7 errors keep working
   next to it. README, "Responses Rtry cannot find".
 - `Rules\ResponseStatusRule`: the status from the locator. `default()` keeps

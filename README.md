@@ -130,8 +130,8 @@ Laravel errors keep working alongside it. For example, a client that keeps the r
 behind a method of its own:
 
 ```php
+use Gohany\Rtry\Contracts\ErrorResponse;
 use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
-use Gohany\Rtry\Impl\ErrorResponse;
 use Gohany\Rtry\Impl\RtryPolicyFactory;
 use Gohany\Rtry\Impl\RuleBasedFailureClassifier;
 

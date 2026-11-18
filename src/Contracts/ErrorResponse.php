@@ -1,6 +1,6 @@
 <?php declare(strict_types=1);
 
-namespace Gohany\Rtry\Impl;
+namespace Gohany\Rtry\Contracts;
 
 /**
  * The status and headers of the HTTP response a thrown error carries. Header names are
