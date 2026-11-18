@@ -13,19 +13,20 @@ interface RetryHooksInterface
      *   AttemptOutcomeInterface $outcome,
      *   RetryPolicyInterface $policy,
      *   int $sleepMs,
-     *   array $effectiveContext
+     *   array $headers  rate-limit headers the classifier read, name => list of values
      * ): void
      */
     public function setBetweenAttemptsHook(callable $hook): void;
 
     /**
-     * Runs when we give up (decider=false, attempts exhausted, or deadline).
+     * Runs when we give up after a failed attempt (not retryable, attempts exhausted,
+     * deadline, or retry budget exhausted).
      *
      * Signature: function(
      *   AttemptContextInterface $context,
      *   AttemptOutcomeInterface $outcome,
      *   RetryPolicyInterface $policy,
-     *   array $effectiveContext
+     *   array $headers  rate-limit headers the classifier read, name => list of values
      * ): void
      */
     public function setOnGiveUpHook(callable $hook): void;

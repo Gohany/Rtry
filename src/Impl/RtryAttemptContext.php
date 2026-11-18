@@ -3,40 +3,18 @@
 namespace Gohany\Rtry\Impl;
 
 use Gohany\Retry\AttemptContextInterface;
-use Gohany\Rtry\Contracts\RtryAttemptContextInterface;
 
-final class RtryAttemptContext implements RtryAttemptContextInterface
+final class RtryAttemptContext implements AttemptContextInterface
 {
-    private int $attemptNumber;
-
-    private int $maxAttempts;
-
-    private int $scheduledDelayMs;
-
-    private int $elapsedSinceFirstMs;
-
-    private ?int $remainingBudgetMs;
-
-    /** @var array<string,mixed> */
-    private array $context = [];
-
-    /**
-     * @param array<string,mixed> $context
-     */
+    /** @param array<string,mixed> $context */
     public function __construct(
-        int $attemptNumber,
-        int $maxAttempts,
-        int $scheduledDelayMs,
-        int $elapsedSinceFirstMs,
-        ?int $remainingBudgetMs,
-        array $context = []
+        private readonly int $attemptNumber,
+        private readonly int $maxAttempts,
+        private readonly int $scheduledDelayMs,
+        private readonly int $elapsedSinceFirstMs,
+        private readonly ?int $remainingBudgetMs,
+        private readonly array $context = [],
     ) {
-        $this->attemptNumber = $attemptNumber;
-        $this->maxAttempts = $maxAttempts;
-        $this->scheduledDelayMs = $scheduledDelayMs;
-        $this->elapsedSinceFirstMs = $elapsedSinceFirstMs;
-        $this->remainingBudgetMs = $remainingBudgetMs;
-        $this->context = $context;
     }
 
     public function attemptNumber(): int
@@ -67,11 +45,5 @@ final class RtryAttemptContext implements RtryAttemptContextInterface
     public function context(): array
     {
         return $this->context;
-    }
-
-    public function setRemainingBudgetMs(?int $remainingBudgetMs): RtryAttemptContextInterface
-    {
-        $this->remainingBudgetMs = $remainingBudgetMs;
-        return $this;
     }
 }

@@ -1,34 +1,45 @@
 name: tests
+
 on:
   push:
+    branches: [master]
   pull_request:
 
 jobs:
   phpunit:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.5']
+    name: PHP ${{ matrix.php }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
+      - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.4'
-          coverage: xdebug
-          extensions: mbstring, intl
+          php-version: ${{ matrix.php }}
+          coverage: ${{ matrix.php == '8.5' && 'xdebug' || 'none' }}
           tools: composer
 
-      - name: Install dependencies
-        run: composer install --no-interaction --prefer-dist --no-progress
+      - run: composer install --no-interaction --no-progress --prefer-dist
 
-      - name: Run PHPUnit with coverage
-        run: vendor/bin/phpunit --log-junit junit.xml
+      - name: PHPUnit
+        if: matrix.php != '8.5'
+        run: vendor/bin/phpunit
+
+      - name: PHPUnit with coverage
+        if: matrix.php == '8.5'
+        run: vendor/bin/phpunit --coverage-clover coverage.xml --log-junit junit.xml
 
       - name: Upload coverage to Codecov
+        if: matrix.php == '8.5'
         uses: codecov/codecov-action@v5
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
       - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
+        if: matrix.php == '8.5' && !cancelled()
         uses: codecov/test-results-action@v1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

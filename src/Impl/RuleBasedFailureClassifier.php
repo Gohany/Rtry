@@ -6,6 +6,8 @@ use Gohany\Rtry\Contracts\FailureClassifierInterface;
 use Gohany\Rtry\Contracts\FailureMetadataInterface;
 use Gohany\Rtry\Contracts\RuleBasedClassifierInterface;
 use Gohany\Rtry\Contracts\RuleInterface;
+use Gohany\Rtry\Impl\Rules\MethodStatusRule;
+use Gohany\Rtry\Impl\Rules\RateLimitBackoffRule;
 
 final class RuleBasedFailureClassifier implements FailureClassifierInterface, RuleBasedClassifierInterface
 {
@@ -19,6 +21,15 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
     public function __construct(array $rules = [])
     {
         $this->rules = $rules;
+    }
+
+    /**
+     * What every policy gets unless a classifier is injected: the status of a PSR-7 response
+     * on the error (getResponse()), and Retry-After / RateLimit-Reset from its headers.
+     */
+    public static function default(): self
+    {
+        return new self([new MethodStatusRule(['getResponse']), new RateLimitBackoffRule()]);
     }
 
     public function classify(\Throwable $e): FailureMetadataInterface

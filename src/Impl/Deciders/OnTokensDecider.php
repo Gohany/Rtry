@@ -5,34 +5,56 @@ namespace Gohany\Rtry\Impl\Deciders;
 use Gohany\Retry\AttemptContextInterface;
 use Gohany\Retry\AttemptOutcomeInterface;
 use Gohany\Retry\RetryDeciderInterface;
-use Gohany\Rtry\Contracts\TokenDeciderInterface;
+use Gohany\Rtry\Impl\FailureToken;
 
-final class OnTokensDecider implements RetryDeciderInterface, TokenDeciderInterface
+/**
+ * SPEC 6.3: a failed outcome is retryable when any token matches it. A three-digit token
+ * matches that status, a family (5xx) any status in it, any other token an equal tag
+ * (case-insensitive). "default" expands to FailureToken::defaults().
+ */
+final class OnTokensDecider implements RetryDeciderInterface
 {
-    /** @var array<int,string|int> */
-    private array $tokens;
+    /** @var list<int> */
+    private readonly array $statuses;
+    /** @var list<int> status families, e.g. 5 for 5xx */
+    private readonly array $families;
+    /** @var list<string> upper-cased */
+    private readonly array $tags;
+
+    /** @param list<int|string> $tokens */
+    public function __construct(array $tokens = [FailureToken::DEFAULT])
+    {
+        $statuses = $families = $tags = [];
+        foreach (self::expand($tokens) as $token) {
+            if (preg_match('~^[1-5][0-9]{2}$~', $token)) {
+                $statuses[] = (int) $token;
+            } elseif (preg_match('~^([1-5])XX$~', $token, $m)) {
+                $families[] = (int) $m[1];
+            } else {
+                $tags[] = $token;
+            }
+        }
+        $this->statuses = array_values(array_unique($statuses));
+        $this->families = array_values(array_unique($families));
+        $this->tags = array_values(array_unique($tags));
+    }
 
     /**
-     * @param array<int,string|int> $tokens e.g., ['5xx', '429', 'ETIMEDOUT', 'NETWORK_ERROR']
+     * @param list<int|string> $tokens
+     * @return list<string> upper-cased, "default" expanded
      */
-    public function __construct(array $tokens)
+    private static function expand(array $tokens): array
     {
-        $this->tokens = array_map(function ($t) {
-            return is_int($t) ? $t : strtoupper((string) $t);
-        }, $tokens);
-    }
-
-    public function setTokens(array $tokens): self
-    {
-        $this->tokens = array_map(function ($t) {
-            return is_int($t) ? $t : strtoupper((string) $t);
-        }, $tokens);
-        return $this;
-    }
-
-    public function getTokens(): array
-    {
-        return $this->tokens;
+        $out = [];
+        foreach ($tokens as $token) {
+            $token = strtoupper(trim((string) $token));
+            if ($token === FailureToken::DEFAULT) {
+                array_push($out, ...FailureToken::defaults());
+            } elseif ($token !== '') {
+                $out[] = $token;
+            }
+        }
+        return $out;
     }
 
     public function shouldRetry(AttemptOutcomeInterface $outcome, AttemptContextInterface $context): bool
@@ -42,24 +64,15 @@ final class OnTokensDecider implements RetryDeciderInterface, TokenDeciderInterf
         }
 
         $status = $outcome->statusCode();
-        $tags   = array_map('strtoupper', $outcome->tags());
-
-        foreach ($this->tokens as $tag) {
-            // exact code
-            if (is_int($tag) && $status === $tag) {
+        if ($status !== null) {
+            if (in_array($status, $this->statuses, true) || in_array(intdiv($status, 100), $this->families, true)) {
                 return true;
             }
+        }
 
-            if (is_string($tag)) {
-                // 5xx / 4xx
-                $tag = strtoupper($tag);
-                if (($tag === '5XX' && $status !== null && (int) floor($status / 100) === 5) ||
-                    ($tag === '4XX' && $status !== null && (int) floor($status / 100) === 4)) {
-                    return true;
-                }
-                if (in_array($tag, $tags, true)) {
-                    return true;
-                }
+        foreach ($outcome->tags() as $tag) {
+            if (in_array(strtoupper((string) $tag), $this->tags, true)) {
+                return true;
             }
         }
 

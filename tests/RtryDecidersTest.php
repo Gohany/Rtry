@@ -161,16 +161,4 @@ final class RtryDecidersTest extends TestCase
         $this->assertFalse($ans1);
         $this->assertFalse($ans2);
     }
-
-    public function test_on_tokens_decider_set_tokens_normalizes_and_get_tokens(): void
-    {
-        // Arrange
-        $dec = new OnTokensDecider(['retry-after', 429, '5xx']);
-        $dec->setTokens(['Transient', '4XX', 503, 'retry-after']);
-        $tokens = $dec->getTokens();
-
-        // Assert
-        // Ints preserved, strings uppercased & deduped order preserved per implementation
-        $this->assertSame(['TRANSIENT', '4XX', 503, 'RETRY-AFTER'], $tokens);
-    }
 }

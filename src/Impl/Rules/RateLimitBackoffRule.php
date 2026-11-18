@@ -9,7 +9,7 @@ use Gohany\Rtry\Impl\FailureMetadata;
 /**
  * Extracts backoff hints from HTTP response headers:
  * - Retry-After: seconds (delta) or HTTP-date (absolute)
- * - RateLimit-Reset / X-RateLimit-Reset: epoch seconds (absolute) OR small integer (delta)
+ * - RateLimit-Reset / X-RateLimit-Reset: delta seconds below 10^9, otherwise epoch seconds or ms
  * - RateLimit-Reset-After / X-RateLimit-Reset-After: delta seconds
  *
  * Tags 'RATE_LIMITED' when a rate-limit header is observed.
@@ -167,13 +167,17 @@ final class RateLimitBackoffRule implements RuleInterface
                 }
             }
         }
-        foreach (['ratelimit-reset', 'x-ratelimit-reset'] as $k) { // seconds OR ms depending on magnitude
+        foreach (['ratelimit-reset', 'x-ratelimit-reset'] as $k) {
             if (isset($headers[$k]) && $this->isNumericLike($headers[$k])) {
                 $num = (float)$headers[$k];
                 if ($num <= 0) {
                     continue;
                 }
-                // Heuristic: <= 10^11 => seconds (epoch), >= 10^12 => ms.
+                // The IETF RateLimit fields send delta seconds; older X-RateLimit-Reset headers
+                // send an epoch time in seconds or ms. Below 10^9 (2001 as an epoch) is a delta.
+                if ($num < 1e9) {
+                    return ['minNextDelayMs' => (int)round($num * 1000.0), 'notBeforeUnixMs' => null, 'usedKeys' => [$k]];
+                }
                 $ms = ($num >= 1e12) ? (int)$num : (int)round($num * 1000.0);
 
                 return ['minNextDelayMs' => null, 'notBeforeUnixMs' => $ms, 'usedKeys' => [$k]];
