@@ -101,4 +101,11 @@ final class Duration
         return $str . '%';
     }
 
+
+    /** A number without trailing zeros: 1.50 -> "1.5", 2.0 -> "2". */
+    public static function formatNumber(float $n): string
+    {
+        $str = rtrim(rtrim(number_format($n, 6, '.', ''), '0'), '.');
+        return $str === '' || $str === '-0' ? '0' : $str;
+    }
 }

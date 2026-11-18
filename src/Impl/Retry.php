@@ -2,41 +2,84 @@
 
 namespace Gohany\Rtry\Impl;
 
-use Gohany\Retry\AttemptContextInterface;
-use Gohany\Retry\AttemptOutcomeInterface;
-use Gohany\Retry\RetryPolicyInterface;
+use Gohany\Retry\CircuitBreakerInterface;
+use Gohany\Retry\CircuitOpenException;
+use Gohany\Retry\GiveUpReason;
+use Gohany\Retry\RetryBudgetInterface;
 use Gohany\Retry\RetryerInterface;
+use Gohany\Retry\RetryPolicyInterface;
+use Gohany\Retry\RetryResultInterface;
+use Gohany\Retry\SleeperInterface;
+use Gohany\Rtry\Contracts\FailureClassifierInterface;
 use Gohany\Rtry\Contracts\RetryHooksInterface;
-use Gohany\Rtry\Contracts\RtryAttemptContextInterface;
-use Gohany\Rtry\Contracts\RtryPolicyInterface;
-use Gohany\Rtry\Contracts\SleeperInterface;
 use Psr\Clock\ClockInterface;
 use Psr\Log\LoggerInterface;
+use Random\Randomizer;
 use Throwable;
 
 /**
- * Retry service implementing Gohany\Retry\RetryerInterface.
+ * Runs an operation under a policy, sleeping between attempts (SPEC 5.1).
  *
- * Notes:
- *  - Per-attempt timeouts are advisory; this class cannot forcibly cancel a running callable.
- *  - Hedging is not performed in-process.
+ * - try() returns the operation's value and rethrows the last attempt's error on give-up;
+ *   tryOutcome() returns a RetryResult that also says why it stopped.
+ * - Delays come from RtryScheduler: backoff, cap, jitter, Retry-After, deadline.
+ * - Time comes from the one injected PSR-20 clock; waits go through the SleeperInterface.
+ * - withGuard() adds a retry budget and/or circuit breaker for one downstream key.
+ * - Per-attempt timeouts (t) are advisory and hedging (h) is a hint: PHP cannot pre-empt
+ *   a running callable, and attempts run one at a time.
+ *
+ * Sleeping here is for short synchronous calls under a deadline. A retry that can wait
+ * should be stored with RtryScheduler::next()'s delay instead.
  */
 final class Retry implements RetryerInterface, RetryHooksInterface
 {
-    private ClockInterface $clock;
-    private SleeperInterface $sleeper;
-    private ?LoggerInterface $logger;
+    private readonly ClockInterface $clock;
+    private readonly SleeperInterface $sleeper;
+    private readonly RtryScheduler $scheduler;
+    private readonly FailureClassifierInterface $fallbackClassifier;
+
+    private ?string $guardKey = null;
+    private ?RetryBudgetInterface $budget = null;
+    private ?CircuitBreakerInterface $breaker = null;
 
     /** @var null|callable */
     private $betweenHook = null;
     /** @var null|callable */
     private $onGiveUpHook = null;
 
-    public function __construct(?ClockInterface $clock = null, ?SleeperInterface $sleeper = null, ?LoggerInterface $logger = null)
-    {
+    /**
+     * @param Randomizer|null $random leave null outside tests: an unseeded Randomizer per
+     *        process. A seed shared by many workers makes them retry in step.
+     */
+    public function __construct(
+        ?ClockInterface $clock = null,
+        ?SleeperInterface $sleeper = null,
+        private readonly ?LoggerInterface $logger = null,
+        ?Randomizer $random = null,
+    ) {
         $this->clock = $clock ?? new NativeClock();
         $this->sleeper = $sleeper ?? new NativeSleeper();
-        $this->logger = $logger;
+        $this->scheduler = new RtryScheduler($this->clock, $random ?? new Randomizer());
+        $this->fallbackClassifier = RuleBasedFailureClassifier::default();
+    }
+
+    /**
+     * A copy that also consults a retry budget and/or a circuit breaker under $key, usually
+     * one downstream service. The budget is asked before each retry and credited on success;
+     * the breaker is asked before each attempt and told each attempt's result. A failure the
+     * policy does not retry (a 4xx, say) counts as a success for the breaker: the service
+     * answered.
+     */
+    public function withGuard(string $key, ?RetryBudgetInterface $budget = null, ?CircuitBreakerInterface $breaker = null): self
+    {
+        if ($key === '') {
+            throw new \InvalidArgumentException('A guard key cannot be empty');
+        }
+        $clone = clone $this;
+        $clone->guardKey = $key;
+        $clone->budget = $budget;
+        $clone->breaker = $breaker;
+        return $clone;
     }
 
     public function setBetweenAttemptsHook(callable $hook): void
@@ -49,329 +92,153 @@ final class Retry implements RetryerInterface, RetryHooksInterface
         $this->onGiveUpHook = $hook;
     }
 
-    /**
-     * {@inheritdoc}
-     */
-    public function try(callable $operation, RetryPolicyInterface $policy, array $context = []): AttemptOutcomeInterface
+    public function try(callable $operation, RetryPolicyInterface $policy, array $context = []): mixed
+    {
+        $result = $this->tryOutcome($operation, $policy, $context);
+        if ($result->isSuccess()) {
+            return $result->value();
+        }
+        $error = $result->lastError();
+        \assert($error !== null);
+        throw $error;
+    }
+
+    public function tryOutcome(callable $operation, RetryPolicyInterface $policy, array $context = []): RetryResultInterface
     {
         $maxAttempts = max(1, $policy->attempts());
-        [$firstMono, $deadlineAt] = $this->initTiming($policy);
+        $classifier = $policy instanceof RtryPolicy ? $policy->failureClassifier() : $this->fallbackClassifier;
 
-        if ($this->logger !== null) {
-            $this->logger->debug('retry.start', [
-                'attempts' => $maxAttempts,
-                'start_after_ms' => $policy->startAfterMs(),
-                'attempt_timeout_ms' => $policy->attemptTimeoutMs(),
-                'deadline_budget_ms' => $policy->deadlineBudgetMs(),
-                'context_keys' => array_keys($context),
-            ]);
+        $delay = $policy->startAfterMs();
+        if ($delay > 0) {
+            $this->sleeper->sleepMs($delay);
         }
 
-        $delayBeforeFirst = max(0, $policy->startAfterMs());
-        if ($delayBeforeFirst > 0) {
-            $this->enforceDeadlineOrSleep($delayBeforeFirst, $deadlineAt);
-        }
-
+        $firstMs = $this->nowMs();
+        $deadlineMs = $policy->deadlineBudgetMs() !== null ? $firstMs + $policy->deadlineBudgetMs() : null;
         $lastError = null;
-        $scheduledDelayForAttempt = $delayBeforeFirst;
 
-        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+        for ($attempt = 1; ; $attempt++) {
+            if ($this->breaker !== null && !$this->breaker->allow((string) $this->guardKey)) {
+                $error = $lastError ?? new CircuitOpenException((string) $this->guardKey);
+                return $this->giveUp($error, $attempt - 1, GiveUpReason::CircuitOpen);
+            }
 
-            [$elapsedMs, $remainingBudgetMs] = $this->computeElapsedAndRemaining($firstMono, $deadlineAt);
-
-            $attemptContext = $this->newAttemptContext(
-                $attempt,
-                $maxAttempts,
-                $scheduledDelayForAttempt,
-                $elapsedMs,
-                $remainingBudgetMs,
-                $context
-            );
-
-            $this->ensureTimeLeftOrGiveUp(
-                $attemptContext,
-                $deadlineAt,
-                $policy,
-                $lastError,
-                $headers ?? []
-            );
+            $attemptContext = $this->context($attempt, $maxAttempts, $delay, $firstMs, $deadlineMs, $context);
+            $this->log('debug', 'retry.attempt', ['attempt' => $attempt, 'max_attempts' => $maxAttempts, 'scheduled_delay_ms' => $delay]);
 
             try {
+                $value = $operation($attemptContext);
+            } catch (Throwable $error) {
+                $lastError = $error;
+                $metadata = $classifier->classify($error);
+                foreach ($metadata->getContextPatch() as $k => $v) {
+                    $context[$k] = $v;
+                }
+                $outcome = RtryAttemptOutcome::fromMetadata($error, $metadata, $this->nowMs());
 
-                $result = $operation($attemptContext);
+                // Never log the message: it can carry request data. Class, status and tags only.
+                $this->log('warning', 'retry.failure', [
+                    'attempt' => $attempt,
+                    'exception_class' => get_class($error),
+                    'status_code' => $outcome->statusCode(),
+                    'tags' => $outcome->tags(),
+                ]);
 
-                if ($this->logger !== null) {
-                    $this->logger->info('retry.success', [
-                        'attempt' => $attempt,
-                        'total_elapsed_ms' => $elapsedMs,
-                    ]);
+                $decision = $this->scheduler->next(
+                    $policy,
+                    $outcome,
+                    $this->context($attempt, $maxAttempts, $delay, $firstMs, $deadlineMs, $context),
+                );
+                $reason = $decision->giveUpReason();
+
+                if ($this->breaker !== null) {
+                    $reason === GiveUpReason::NotRetryable
+                        ? $this->breaker->recordSuccess((string) $this->guardKey)
+                        : $this->breaker->recordFailure((string) $this->guardKey);
                 }
 
-                return new RtryAttemptOutcome($result);
-
-            } catch (Throwable $e) {
-
-                $lastError = $e;
-                $statusCode = null;
-                $tags = [];
-                $minDelayMs = null;
-                $notBeforeMs = null;
-                $headers = [];
-
-                if ($policy instanceof RtryPolicyInterface && $policy->failureClassifier() !== null) {
-
-                    $metadata     = $policy->failureClassifier()->classify($e);
-                    $statusCode   = $metadata->getStatusCode();
-                    $tags         = $metadata->getTags();
-                    $ctxPatch     = $metadata->getContextPatch();
-                    $minDelayMs   = $metadata->getMinNextDelayMs();
-                    $notBeforeMs  = $metadata->getNotBeforeUnixMs();
-                    $headers      = $metadata->getHeaders();
-
-                    if (!empty($ctxPatch)) {
-                        foreach ($ctxPatch as $k => $v) {
-                            $context[$k] = $v;
-                        }
-                    }
-
-                    if ($this->logger !== null) {
-                        $this->logger->warning('retry.failure.classified', [
-                            'attempt' => $attempt,
-                            'exception_class' => get_class($e),
-                            'message' => $e->getMessage(),
-                            'code' => $e->getCode(),
-                            'status_code' => $statusCode,
-                            'tags' => $tags,
-                            'min_next_delay_ms' => $minDelayMs,
-                            'not_before_unix_ms' => $notBeforeMs,
-                            'header_hints_present' => !empty($headers),
-                        ]);
-                    }
-
-                } else {
-                    if ($this->logger !== null) {
-                        $this->logger->warning('retry.failure.unclassified', [
-                            'attempt' => $attempt,
-                            'exception_class' => get_class($e),
-                            'message' => $e->getMessage(),
-                            'code' => $e->getCode(),
-                        ]);
-                    }
+                if ($reason !== null) {
+                    $this->runGiveUpHook($attemptContext, $outcome, $policy, $metadata->getHeaders());
+                    return $this->giveUp($error, $attempt, $reason);
                 }
 
-                $outcome = new RtryAttemptOutcome(null, $e, $statusCode, $tags);
-
-                $shouldRetry = $policy->decider()->shouldRetry($outcome, $attemptContext);
-
-                if ($this->logger !== null) {
-                    $this->logger->debug('retry.decision', [
-                        'attempt' => $attempt,
-                        'should_retry' => $shouldRetry,
-                        'status_code' => $statusCode,
-                        'tags' => $tags,
-                    ]);
+                if ($this->budget !== null && !$this->budget->tryAcquire((string) $this->guardKey)) {
+                    $this->runGiveUpHook($attemptContext, $outcome, $policy, $metadata->getHeaders());
+                    return $this->giveUp($error, $attempt, GiveUpReason::BudgetExhausted);
                 }
 
-                if (!$shouldRetry || $attempt === $maxAttempts) {
-                    $this->runGiveUpHookOnce($attemptContext, $outcome, $policy, $headers);
-                    throw $e;
-                }
-
-                $sleepMs = $policy->nextDelayMs($attempt + 1);
-                $follow = $policy->followHeaders();
-
-                // Respect classifier minimums and absolute not-before
-                if ($follow && $minDelayMs !== null) {
-                    $sleepMs = max($sleepMs, 0, $minDelayMs);
-                }
-
-                if ($follow && $notBeforeMs !== null) {
-                    $nowMs = (int) round(((float) $this->clock->now()->format('U.u')) * 1000.0);
-                    $delta = $notBeforeMs - $nowMs;
-                    if ($delta > 0) {
-                        $sleepMs = max($sleepMs, $delta);
-                    }
-                }
-
-                if ($deadlineAt !== null && !$this->hasTimeLeft($deadlineAt, $sleepMs)) {
-                    $this->runGiveUpHookOnce($attemptContext, $outcome, $policy, $headers);
-                    throw $e;
-                }
-
-                if ($this->betweenHook) {
-                    try {
-                        ($this->betweenHook)($attemptContext, $outcome, $policy, $sleepMs, $headers);
-                    } catch (\Throwable $_hookErr) {
-                        // Hooks must not break retry — swallow
-                    }
-                }
-
-                $this->sleeper->sleepMs($sleepMs);
-                $scheduledDelayForAttempt = $sleepMs;
+                $delay = $decision->delayMs();
+                $this->runBetweenHook($attemptContext, $outcome, $policy, $delay, $metadata->getHeaders());
+                $this->sleeper->sleepMs($delay);
+                continue;
             }
+
+            $this->breaker?->recordSuccess((string) $this->guardKey);
+            $this->budget?->recordSuccess((string) $this->guardKey);
+            $this->log('info', 'retry.success', ['attempt' => $attempt, 'elapsed_ms' => $this->nowMs() - $firstMs]);
+
+            return RetryResult::success($value, $attempt);
         }
-
-        $outcome = (new RtryAttemptOutcome())
-            ->setError($lastError ?: new \RuntimeException('unexpected fall-through'));
-
-        $attemptContext = $this->newAttemptContext(
-            $maxAttempts,
-            $maxAttempts,
-            $scheduledDelayForAttempt,
-            (int) round((microtime(true) - $firstMono) * 1000),
-            0,
-            $context
-        );
-
-        $this->runGiveUpHookOnce($attemptContext, $outcome, $policy, $headers ?? []);
-        return $outcome;
     }
 
-    private function initTiming(RetryPolicyInterface $policy): array
+    private function giveUp(Throwable $error, int $attempts, GiveUpReason $reason): RetryResult
     {
-        $firstMono = microtime(true);
-
-        $deadlineAt = null;
-        $deadlineBudgetMs = $policy->deadlineBudgetMs();
-        if ($deadlineBudgetMs !== null) {
-            $deadlineAt = $this->clock->now()->modify(sprintf('+%d milliseconds', $deadlineBudgetMs));
-        }
-
-        return [$firstMono, $deadlineAt];
+        $this->log('error', 'retry.give_up', [
+            'attempts' => $attempts,
+            'reason' => $reason->value,
+            'last_error_class' => get_class($error),
+        ]);
+        return RetryResult::gaveUp($error, $attempts, $reason);
     }
 
-    private function enforceDeadlineOrSleep(int $delayMs, ?\DateTimeImmutable $deadlineAt): void
+    /** @param array<string,mixed> $context */
+    private function context(int $attempt, int $maxAttempts, int $delay, int $firstMs, ?int $deadlineMs, array $context): RtryAttemptContext
     {
-        $delayMs = max(0, $delayMs);
-        if ($delayMs === 0) {
-            return;
-        }
-        if ($deadlineAt !== null && !$this->hasTimeLeft($deadlineAt, $delayMs)) {
-            throw new \RuntimeException('Retry: start-after delay exceeds deadline.');
-        }
-
-        if ($this->logger !== null) {
-            $this->logger->debug('retry.sleep.before_first', [
-                'delay_ms' => $delayMs,
-            ]);
-        }
-
-        $this->sleeper->sleepMs($delayMs);
-    }
-
-    private function computeElapsedAndRemaining(float $firstMono, ?\DateTimeImmutable $deadlineAt): array
-    {
-        $elapsedMs = (int) round((microtime(true) - $firstMono) * 1000);
-        $remainingBudgetMs = $deadlineAt !== null ? $this->remainingMsUntil($deadlineAt) : null;
-        return [$elapsedMs, $remainingBudgetMs];
-    }
-
-    /**
-     * If there is a deadline, and it has been exceeded, run the give-up hook and throw.
-     */
-    private function ensureTimeLeftOrGiveUp(
-        RtryAttemptContextInterface $attemptContext,
-        ?\DateTimeImmutable $deadlineAt,
-        RetryPolicyInterface $policy,
-        ?\Throwable $lastError,
-        array $headers = []
-    ): void {
-
-        if ($deadlineAt === null) {
-            return;
-        }
-
-        $remainingBudgetMs = $this->remainingMsUntil($deadlineAt);
-        if ($remainingBudgetMs > 0) {
-            return;
-        }
-
-        $attemptContext->setRemainingBudgetMs(0);
-
-        $outcome = (new RtryAttemptOutcome())
-            ->setError($lastError ?: new \RuntimeException('deadline exceeded'));
-
-        $this->runGiveUpHookOnce($attemptContext, $outcome, $policy, $headers);
-
-        throw ($lastError ?: new \RuntimeException('Retry: deadline exceeded.'));
-    }
-
-    private function newAttemptContext(
-        int $attempt,
-        int $maxAttempts,
-        int $scheduledDelayForAttempt,
-        int $elapsedMs,
-        ?int $remainingBudgetMs,
-        array $context
-    ): RtryAttemptContextInterface {
-
-        if ($this->logger !== null) {
-            $this->logger->info('retry.attempt', [
-                'attempt' => $attempt,
-                'max_attempts' => $maxAttempts,
-                'scheduled_delay_ms' => $scheduledDelayForAttempt,
-                'elapsed_ms' => $elapsedMs,
-                'remaining_budget_ms' => $remainingBudgetMs,
-            ]);
-        }
-
+        $now = $this->nowMs();
         return new RtryAttemptContext(
             $attempt,
             $maxAttempts,
-            $scheduledDelayForAttempt,
-            $elapsedMs,
-            $remainingBudgetMs,
-            $context
+            $delay,
+            max(0, $now - $firstMs),
+            $deadlineMs !== null ? max(0, $deadlineMs - $now) : null,
+            $context,
         );
     }
 
-    private function hasTimeLeft(\DateTimeInterface $deadlineAt, int $sleepMs): bool
+    private function nowMs(): int
     {
-        $remaining = $this->remainingMsUntil($deadlineAt);
-
-        return $remaining > $sleepMs;
+        return Clock::nowMs($this->clock);
     }
 
-    private function remainingMsUntil(\DateTimeInterface $deadlineAt): int
+    /** @param array<string,mixed> $data */
+    private function log(string $level, string $message, array $data): void
     {
-        $now = $this->clock->now();
-        $delta = ($deadlineAt->format('U.u') - $now->format('U.u')) * 1000.0;
-
-        return (int) max(0, round($delta));
+        $this->logger?->log($level, $message, $data);
     }
 
-    private function runGiveUpHookOnce(
-        AttemptContextInterface $ctx,
-        AttemptOutcomeInterface $outcome,
-        RetryPolicyInterface $policy,
-        array $headers = []
-    ): void {
-
-        $error = $outcome->error();
-        if ($this->logger !== null) {
-            $this->logger->error('retry.give_up', [
-                'attempt' => $ctx->attemptNumber(),
-                'max_attempts' => $ctx->maxAttempts(),
-                'total_elapsed_ms' => $ctx->elapsedSinceFirstMs(),
-                'last_error_class' => $error !== null ? get_class($error) : '',
-                'last_error_message' => $error !== null ? $error->getMessage() : '',
-                'status_code' => $outcome->statusCode(),
-                'tags' => $outcome->tags(),
-            ]);
-        }
-
-        if (!$this->onGiveUpHook) {
+    /** @param array<string,mixed> $headers */
+    private function runBetweenHook(RtryAttemptContext $context, RtryAttemptOutcome $outcome, RetryPolicyInterface $policy, int $sleepMs, array $headers): void
+    {
+        if ($this->betweenHook === null) {
             return;
         }
         try {
-            ($this->onGiveUpHook)($ctx, $outcome, $policy, $headers);
-        } catch (\Throwable $_) {
-            // Hooks must never throw into callers
+            ($this->betweenHook)($context, $outcome, $policy, $sleepMs, $headers);
+        } catch (Throwable) {
+            // A hook must not break the retry.
         }
     }
 
+    /** @param array<string,mixed> $headers */
+    private function runGiveUpHook(RtryAttemptContext $context, RtryAttemptOutcome $outcome, RetryPolicyInterface $policy, array $headers): void
+    {
+        if ($this->onGiveUpHook === null) {
+            return;
+        }
+        try {
+            ($this->onGiveUpHook)($context, $outcome, $policy, $headers);
+        } catch (Throwable) {
+            // A hook must not break the retry.
+        }
+    }
 }
-
-
-
-

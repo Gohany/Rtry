@@ -2,42 +2,66 @@
 
 namespace Gohany\Rtry\Impl\Parts;
 
-use Gohany\Rtry\Contracts\PartInterface;
-use Gohany\Rtry\Contracts\RtryPolicyInterface;
 use Gohany\Retry\SequenceInterface;
 use Gohany\Rtry\Impl\Duration;
 
-final class Sequence extends Part implements PartInterface, SequenceInterface
+/**
+ * seq=<dur>[,<dur>...][*]: explicit delays, the first being the delay before attempt #2.
+ * A trailing * repeats the last delay. Accepts seq=(50,100,1.5s*) and seq=50,100,1.5s,*.
+ */
+final class Sequence implements SequenceInterface
 {
     public const KEY = 'seq';
-    private array $delaysMs;
-    private bool $repeatLast;
-    private int $cursor = 0;
 
-    /**
-     * @param list<int> $delaysMs
-     * @param bool $repeatLast Whether to repeat the last delay indefinitely
-     */
-    public function __construct(array $delaysMs, bool $repeatLast)
-    {
-        $this->delaysMs = $delaysMs;
-        $this->repeatLast = $repeatLast;
+    /** @param list<int> $delaysMs */
+    public function __construct(
+        private readonly array $delaysMs,
+        private readonly bool $repeatLast,
+    ) {
+        if ($delaysMs === []) {
+            throw new \InvalidArgumentException('seq needs at least one delay');
+        }
+        foreach ($delaysMs as $delay) {
+            if (!is_int($delay) || $delay < 0) {
+                throw new \InvalidArgumentException('seq delays must be non-negative integers');
+            }
+        }
     }
 
-    public function key(): string
+    /** Parses the value of seq=. */
+    public static function make(string $value): self
     {
-        return Sequence::KEY;
-    }
+        $v = trim($value);
+        if (str_starts_with($v, '(') && str_ends_with($v, ')')) {
+            $v = trim(substr($v, 1, -1));
+        }
+        if ($v === '') {
+            throw new \InvalidArgumentException('seq cannot be empty');
+        }
 
-    public function __toString(): string
-    {
-        $tokens = array_map(static fn (int $ms) => Duration::formatMs($ms), $this->delaysMs);
-        return Sequence::KEY . '=' . implode(',', $tokens) . ($this->repeatLast ? '*' : '');
-    }
+        $parts = array_map('trim', explode(',', $v));
+        $repeat = false;
+        $last = count($parts) - 1;
+        if ($parts[$last] === '*') {
+            $repeat = true;
+            array_pop($parts);
+        } elseif (str_ends_with($parts[$last], '*')) {
+            $repeat = true;
+            $parts[$last] = rtrim(substr($parts[$last], 0, -1));
+        }
+        if ($parts === []) {
+            throw new \InvalidArgumentException('seq cannot be only "*"');
+        }
 
-    public function applyToPolicy(RtryPolicyInterface $policy): RtryPolicyInterface
-    {
-        return $policy->setSequence($this);
+        $delays = [];
+        foreach ($parts as $part) {
+            if ($part === '') {
+                throw new \InvalidArgumentException('Empty element in seq: ' . $value);
+            }
+            $delays[] = Duration::parseDurationMs($part);
+        }
+
+        return new self($delays, $repeat);
     }
 
     public function delaysMs(): array
@@ -50,105 +74,21 @@ final class Sequence extends Part implements PartInterface, SequenceInterface
         return $this->repeatLast;
     }
 
-    public function reset(): void
+    public function delayMsAt(int $attemptNumber): ?int
     {
-        $this->cursor = 0;
+        if ($attemptNumber < 2) {
+            throw new \InvalidArgumentException('There is no delay before attempt ' . $attemptNumber);
+        }
+        $index = $attemptNumber - 2;
+        if ($index < count($this->delaysMs)) {
+            return $this->delaysMs[$index];
+        }
+        return $this->repeatLast ? $this->delaysMs[count($this->delaysMs) - 1] : null;
     }
 
-    public function nextDelayMs(): ?int
+    /** Canonical value of seq= (SPEC 6.4), without the key. */
+    public function canonical(): string
     {
-        $count = count($this->delaysMs);
-
-        if ($count === 0) {
-            return null;
-        }
-
-        if ($this->cursor < $count) {
-            return $this->delaysMs[$this->cursor++];
-        }
-
-        if ($this->isRepeatLastDelay()) {
-            $this->cursor = $count;
-            return $this->delaysMs[$count - 1];
-        }
-
-        return null;
+        return implode(',', $this->delaysMs) . ($this->repeatLast ? '*' : '');
     }
-
-    public function delayByPosition(int $index): ?int
-    {
-        $count = count($this->delaysMs);
-        $position = $index - 1;
-
-        if ($position < 0) {
-            return null;
-        }
-
-        if ($position >= $count) {
-            if ($this->isRepeatLastDelay()) {
-                return $this->delaysMs[$count - 1];
-            }
-            return null;
-        }
-
-        return $this->delaysMs[$index - 1];
-    }
-
-    /**
-     * Parses seq=(<dur>[,<dur>...][,*]) or raw "(...)" body.
-     *
-     * @return array{0:list<int>,1:bool}
-     */
-    public static function make(string $value): Sequence
-    {
-        $v = trim(Sequence::trimKey($value));
-
-        // Allow both: "seq=(...)" and "(...)"
-        $prefix = self::KEY . '=';
-        if (strncasecmp($v, $prefix, strlen($prefix)) === 0) {
-            $v = ltrim(substr($v, strlen($prefix)));
-        }
-
-        // Parentheses are optional: if present, unwrap; otherwise, parse as-is.
-        if ($v !== '' && $v[0] === '(' && substr($v, -1) === ')') {
-            $v = substr($v, 1, -1);
-        }
-
-        $v = trim($v);
-        if ($v === '') {
-            throw new \InvalidArgumentException('seq cannot be empty');
-        }
-
-        $rawParts = array_map('trim', explode(',', $v));
-        $repeat   = false;
-
-        // Trailing "*" may be either its own element or attached to the last token
-        $lastIdx = count($rawParts) - 1;
-        if ($rawParts[$lastIdx] === '*') {
-            $repeat = true;
-            array_pop($rawParts);
-        } else {
-            $last = $rawParts[$lastIdx];
-            if ($last !== '' && substr($last, -1) === '*') {
-                $repeat = true;
-                $rawParts[$lastIdx] = substr($last, 0, -1);
-            }
-        }
-
-        $delays = [];
-        foreach ($rawParts as $p) {
-            if ($p === '') {
-                throw new \InvalidArgumentException('Empty element in seq: ' . $value);
-            }
-            // No unit => ms. Supports decimals + ms/s/m/h via Duration::parseDurationMs
-            $delays[] = Duration::parseDurationMs($p);
-        }
-
-        if ($repeat && $delays === []) {
-            throw new \InvalidArgumentException('seq cannot be only "*"');
-        }
-
-        return new Sequence($delays, $repeat);
-    }
-
 }

@@ -2,112 +2,46 @@
 
 namespace Gohany\Rtry\Impl\Parts;
 
-use Gohany\Rtry\Contracts\GeneratesRulesInterface;
-use Gohany\Rtry\Contracts\PartInterface;
-use Gohany\Rtry\Contracts\RtryPolicyInterface;
-use Gohany\Rtry\Contracts\RuleBasedClassifierInterface;
-use Gohany\Rtry\Impl\FailureToken;
-use Gohany\Rtry\Impl\RuleBasedFailureClassifier;
-use Gohany\Rtry\Impl\Rules\RateLimitBackoffRule;
+use Gohany\Rtry\Impl\Deciders\OnTokensDecider;
 
 /**
- * on=<codes> (free-form string preserved as-is)
+ * on=<token>[,<token>...]: the retryable statuses, families and tags (SPEC 6.3).
  */
-final class On extends Part implements PartInterface, GeneratesRulesInterface
+final class On
 {
     public const KEY = 'on';
-    private array $tokens;
 
-    public function __construct(array $tokens) {
-        $this->tokens = array_values(array_filter(array_map('trim', $tokens), fn($t) => $t !== ''));
+    /** @param list<string> $tokens as written */
+    private function __construct(private readonly array $tokens)
+    {
     }
 
+    /** Parses the value of on=. */
+    public static function make(string $value): self
+    {
+        $tokens = array_map('trim', explode(',', $value));
+        foreach ($tokens as $token) {
+            if ($token === '' || !preg_match('~^[A-Za-z0-9_.:-]+$~', $token)) {
+                throw new \InvalidArgumentException('Invalid on token "' . $token . '" in: ' . $value);
+            }
+        }
+        return new self($tokens);
+    }
+
+    /** @return list<string> */
     public function tokens(): array
     {
         return $this->tokens;
     }
 
-    public function key(): string
+    public function decider(): OnTokensDecider
     {
-        return On::KEY;
+        return new OnTokensDecider($this->tokens);
     }
 
-    public function __toString(): string
+    /** Canonical value of on= (SPEC 6.4): tokens in input order. */
+    public function canonical(): string
     {
-        return On::KEY . '=' . implode(',', $this->tokens);
+        return implode(',', $this->tokens);
     }
-
-    public function applyToPolicy(RtryPolicyInterface $policy): RtryPolicyInterface
-    {
-        $tokens = [];
-        if (empty($tokens)) {
-            $tokens[] = 'default';
-        } else {
-            foreach ($tokens as $token) {
-                if ($this->isDefaultTag($token)) {
-                    $tokens = array_merge($tokens, FailureToken::defaults());
-                    break;
-                }
-            }
-        }
-        return $policy->setRetryOnTokens($tokens);
-    }
-
-    public function addRulesToClassifier(?RuleBasedClassifierInterface $classifier): RuleBasedClassifierInterface
-    {
-
-        if ($classifier === null) {
-            $classifier = new RuleBasedFailureClassifier();
-        }
-
-        foreach($this->tokens as $token) {
-
-            if ($this->matchesRateLimitSpec($token) && !$classifier->hasRuleOfType(RateLimitBackoffRule::class)) {
-                $classifier->addRule(new RateLimitBackoffRule());
-            }
-
-        }
-
-        return $classifier;
-    }
-
-    private function isDefaultTag(string $tag): bool
-    {
-        return in_array(strtolower($tag), ['default', 'standard'], true);
-    }
-
-    private function matchesRateLimitSpec(string $tag): bool
-    {
-        // Normalize: uppercase and strip non-alphanumeric for easy matching
-        $norm = strtoupper($tag);
-        $norm = (string)preg_replace('/[^A-Z0-9]/', '', $norm);
-
-        if ($norm === '429' || strpos($norm, '429') !== false) {
-            return true;
-        }
-
-        // Common synonyms and variations
-        if (strpos($norm, 'RATELIMIT') !== false) {
-            return true;
-        }
-        if (strpos($norm, 'TOOMANYREQUESTS') !== false) {
-            return true;
-        }
-        if (strpos($norm, 'THROTTL') !== false) { // THROTTLE / THROTTLED / THROTTLING
-            return true;
-        }
-
-        // Heuristic: both RATE and LIMIT words present (after stripping separators)
-        if (strpos($norm, 'RATE') !== false && strpos($norm, 'LIMIT') !== false) {
-            return true;
-        }
-
-        return false;
-    }
-
-    public static function make(string $value): PartInterface
-    {
-        return new On(explode(',', On::trimKey($value)));
-    }
-
 }

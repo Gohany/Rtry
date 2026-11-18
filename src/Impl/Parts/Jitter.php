@@ -3,41 +3,91 @@
 namespace Gohany\Rtry\Impl\Parts;
 
 use Gohany\Retry\JitterInterface;
-use Gohany\Rtry\Contracts\PartInterface;
-use Gohany\Rtry\Contracts\RtryPolicyInterface;
 use Gohany\Rtry\Impl\Duration;
+use Random\Randomizer;
 
-class Jitter extends Part implements PartInterface, JitterInterface
+/**
+ * j=<window>[@full|pm|none] (SPEC 6.2). The window is a duration or a percent of the delay.
+ *
+ * full: a uniform integer in [max(0, D - w), D]. pm: [max(0, D - w), D + w]. none: D.
+ * Exactly one Randomizer::getInt() draw when the bounds differ, none otherwise.
+ */
+final class Jitter implements JitterInterface
 {
-
     public const KEY = 'j';
 
-    private ?int $windowMs;
-
-    private string $mode;
-    private ?float $percent;
-
-
-    public function __construct(?int $windowMs, string $mode = 'full', ?float $percent = null)
-    {
-        if ($windowMs < 0 && ($percent === null || $percent < 0)) {
-            throw new \InvalidArgumentException('Jitter window must be >= 0');
-        }
-        $mode = strtolower($mode);
-        if ($mode !== 'full' && $mode !== 'pm') {
-            throw new \InvalidArgumentException('Invalid jitter mode: ' . $mode);
-        }
-        if ($percent !== null) {
-            if (!is_finite($percent) || $percent < 0.0 || $percent > 100.0) {
-                throw new \InvalidArgumentException('Jitter percent must be between 0 and 100');
-            }
-        }
-
-        $this->windowMs = $percent === null ? $windowMs : null; // exclusivity
-        $this->mode = $mode;
-        $this->percent = $percent;
+    private function __construct(
+        private readonly string $mode,
+        private readonly ?float $percent,
+        private readonly ?int $windowMs,
+    ) {
     }
 
+    /** No j: classic full jitter, [0, D]. */
+    public static function default(): self
+    {
+        return new self(self::MODE_FULL, 100.0, null);
+    }
+
+    public static function none(): self
+    {
+        return new self(self::MODE_NONE, null, null);
+    }
+
+    public static function percentOf(float $percent, string $mode = self::MODE_FULL): self
+    {
+        if (!is_finite($percent) || $percent < 0.0 || $percent > 100.0) {
+            throw new \InvalidArgumentException('Jitter percent must be between 0 and 100: ' . $percent);
+        }
+        return $percent == 0.0 ? self::none() : new self(self::parseMode($mode), $percent, null);
+    }
+
+    public static function window(int $windowMs, string $mode = self::MODE_FULL): self
+    {
+        if ($windowMs < 0) {
+            throw new \InvalidArgumentException('Jitter window cannot be negative: ' . $windowMs);
+        }
+        return $windowMs === 0 ? self::none() : new self(self::parseMode($mode), null, $windowMs);
+    }
+
+    /** Parses the value of j=. */
+    public static function make(string $value): self
+    {
+        $v = strtolower(trim($value));
+        if ($v === 'none') {
+            return self::none();
+        }
+
+        $mode = self::MODE_FULL;
+        $at = strpos($v, '@');
+        if ($at !== false) {
+            $mode = trim(substr($v, $at + 1));
+            $v = trim(substr($v, 0, $at));
+        }
+        $mode = self::parseMode($mode);
+        if ($mode === self::MODE_NONE) {
+            return self::none();
+        }
+
+        if (str_ends_with($v, '%')) {
+            $number = substr($v, 0, -1);
+            if (!preg_match('~^[0-9]+(?:\.[0-9]+)?$~', $number)) {
+                throw new \InvalidArgumentException('Invalid jitter percent: ' . $value);
+            }
+            return self::percentOf((float) $number, $mode);
+        }
+
+        return self::window(Duration::parseDurationMs($v), $mode);
+    }
+
+    private static function parseMode(string $mode): string
+    {
+        $mode = strtolower($mode);
+        if (!in_array($mode, [self::MODE_FULL, self::MODE_PM, self::MODE_NONE], true)) {
+            throw new \InvalidArgumentException('Invalid jitter mode "' . $mode . '"; expected full, pm or none');
+        }
+        return $mode;
+    }
 
     public function mode(): string
     {
@@ -54,124 +104,30 @@ class Jitter extends Part implements PartInterface, JitterInterface
         return $this->windowMs;
     }
 
-    public function apply(int $nominalDelayMs, ?int $seed = null): int
+    public function apply(int $nominalDelayMs, Randomizer $random): int
     {
-        if ($nominalDelayMs <= 0) {
-            return 0;
+        $delay = max(0, $nominalDelayMs);
+        if ($this->mode === self::MODE_NONE) {
+            return $delay;
         }
 
         $window = $this->percent !== null
-            ? (int) round(($this->percent / 100.0) * $nominalDelayMs)
-            : $this->windowMs ?? 0;
+            ? (int) round($this->percent / 100.0 * $delay)
+            : (int) $this->windowMs;
 
-        if ($window <= 0) {
-            return $this->mode === 'pm' ? $nominalDelayMs : 0;
-        }
+        $low = max(0, $delay - $window);
+        $high = $this->mode === self::MODE_PM ? $delay + $window : $delay;
 
-        if ($this->mode === 'pm') {
-            $delta = $this->randInRange(-$window, $window, $seed, $nominalDelayMs);
-            $v = $nominalDelayMs + $delta;
-            return max($v, 0);
-        }
-
-        // 'full' mode
-        return $this->randInRange(0, $window, $seed, $nominalDelayMs);
+        return $low < $high ? $random->getInt($low, $high) : $low;
     }
 
-    public function key(): string
+    /** Canonical value of j= (SPEC 6.4), without the key. */
+    public function canonical(): string
     {
-        return self::KEY;
-    }
-
-    public function __toString(): string
-    {
-        $value = $this->percent !== null
-            ? Duration::formatPercent($this->percent)
-            : Duration::formatMs($this->windowMs);
-
-        return $this->mode === 'full'
-            ? self::KEY . '=' . $value
-            : self::KEY . '=' . $value . '@pm';
-    }
-
-    public function applyToPolicy(RtryPolicyInterface $policy): RtryPolicyInterface
-    {
-        return $policy->setJitterSpec($this);
-    }
-
-    /**
-     * Deterministic-ish range when $seed is provided; otherwise random_int().
-     */
-    private function randInRange(int $min, int $max, ?int $seed, int $mix): int
-    {
-        if ($max <= $min) {
-            return $min;
+        if ($this->mode === self::MODE_NONE) {
+            return 'none';
         }
-
-        if ($seed === null) {
-            try {
-                return random_int($min, $max);
-            } catch (\Throwable $e) {
-                $u = mt_rand() / max(1, mt_getrandmax());
-                return $min + (int)floor($u * ($max - $min + 1));
-            }
-        }
-
-        // Simple deterministic hash -> [0,1)
-        $h = sprintf('%u', crc32($seed . ':' . $mix . ':' . self::KEY . ':' . $this->mode));
-        $frac = ((int) $h % 1000000) / 1000000.0; // 6 digits of precision
-        return $min + (int) floor(($max - $min + 1) * $frac);
+        $amount = $this->percent !== null ? Duration::formatNumber($this->percent) . '%' : (string) $this->windowMs;
+        return $amount . '@' . $this->mode;
     }
-
-    public static function make(string $value): Jitter
-    {
-        $v = trim(Jitter::trimKey($value));
-        if ($v === '' || $v === '0' || $v === '0%') {
-            // Default: no jitter, full mode. 0% is effectively no jitter.
-            return new Jitter(null, 'full', $v === '0%' ? 0.0 : null);
-        }
-
-        $mode = 'full';
-        $durToken = $v;
-
-        $at = strpos($v, '@');
-        if ($at !== false) {
-            $durToken = trim(substr($v, 0, $at));
-            $modeToken = strtolower(trim(substr($v, $at + 1)));
-            if ($modeToken !== '') {
-                if ($modeToken !== 'full' && $modeToken !== 'pm') {
-                    throw new \InvalidArgumentException('Invalid jitter mode "' . $modeToken . '". Expected "full" or "pm".');
-                }
-                $mode = $modeToken;
-            }
-        }
-
-        $windowMs = null;
-        $percent = null;
-
-        if ($durToken !== '' && $durToken !== '0') {
-            // Support percentage e.g. "15%" or "12.5%"
-            if (substr($durToken, -1) === '%') {
-                $num = trim(substr($durToken, 0, -1));
-                if ($num === '' || !is_numeric($num)) {
-                    throw new \InvalidArgumentException('Invalid jitter percent: ' . $value);
-                }
-                $percent = (float)$num;
-                if ($percent < 0 || $percent > 100) {
-                    throw new \InvalidArgumentException('Jitter percent must be between 0 and 100: ' . $value);
-                }
-                $windowMs = null;
-            } else {
-                // Duration in ms|s|m|h etc.
-                $windowMs = Duration::parseDurationMs($durToken);
-                if ($windowMs < 0) {
-                    throw new \InvalidArgumentException('Jitter window must be >= 0: ' . $value);
-                }
-            }
-        }
-
-        // Pass both window and percent; downstream can choose which to use.
-        return new Jitter($windowMs, $mode, $percent);
-    }
-
 }

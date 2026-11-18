@@ -3,45 +3,39 @@
 namespace Gohany\Rtry\Impl\Parts;
 
 use Gohany\Retry\HedgeInterface;
-use Gohany\Rtry\Contracts\PartInterface;
-use Gohany\Rtry\Contracts\RtryPolicyInterface;
 use Gohany\Rtry\Impl\Duration;
 
 /**
- * h=<n>@<delay>
+ * h=<lanes>@<stagger>[&<0|1>]. A hint only: Rtry runs attempts one at a time and does not
+ * hedge (SPEC 2). Callers that can run concurrent requests may read it.
  */
-final class Hedge extends Part implements PartInterface, HedgeInterface
+final class Hedge implements HedgeInterface
 {
     public const KEY = 'h';
-    private int $lanes;
-    private int $delayMs;
-    private int $cancelPolicy;
 
-    public function __construct(int $lanes, int $delayMs, ?int $cancelPolicy) {
-        $this->delayMs = $delayMs;
-        $this->lanes = $lanes;
-        $this->cancelPolicy = $cancelPolicy ?: self::CANCEL_ON_FIRST_SUCCESS;
+    public function __construct(
+        private readonly int $lanes,
+        private readonly int $staggerDelayMs,
+        private readonly int $cancelPolicy = self::CANCEL_ON_FIRST_SUCCESS,
+    ) {
+        if ($lanes < 1) {
+            throw new \InvalidArgumentException('Hedge lanes must be at least 1: ' . $lanes);
+        }
+        if ($staggerDelayMs < 0) {
+            throw new \InvalidArgumentException('Hedge stagger cannot be negative');
+        }
+        if (!in_array($cancelPolicy, [self::CANCEL_ON_FIRST_SUCCESS, self::CANCEL_ON_FIRST_COMPLETION], true)) {
+            throw new \InvalidArgumentException('Hedge cancel policy must be 0 or 1: ' . $cancelPolicy);
+        }
     }
 
-    public function key(): string
+    /** Parses the value of h=. */
+    public static function make(string $value): self
     {
-        return Hedge::KEY;
-    }
-
-    public function __toString(): string
-    {
-        return Hedge::KEY . '=' . $this->lanes . '@' . Duration::formatMs($this->delayMs) .
-            ($this->cancelPolicy !== self::CANCEL_ON_FIRST_SUCCESS ? '&' . $this->cancelPolicy : '');
-    }
-
-    public function cancelPolicy(): int
-    {
-        return $this->cancelPolicy;
-    }
-
-    public function staggerDelayMs(): int
-    {
-        return $this->delayMs;
+        if (!preg_match('~^\s*([0-9]+)\s*@\s*([^&]+?)\s*(?:&\s*([0-9]+)\s*)?$~', $value, $m)) {
+            throw new \InvalidArgumentException('Invalid hedge, expected <lanes>@<stagger>[&<0|1>]: ' . $value);
+        }
+        return new self((int) $m[1], Duration::parseDurationMs($m[2]), isset($m[3]) ? (int) $m[3] : self::CANCEL_ON_FIRST_SUCCESS);
     }
 
     public function lanes(): int
@@ -49,50 +43,20 @@ final class Hedge extends Part implements PartInterface, HedgeInterface
         return $this->lanes;
     }
 
-    public function applyToPolicy(RtryPolicyInterface $policy): RtryPolicyInterface
+    public function staggerDelayMs(): int
     {
-        return $policy->setHedgeSpec($this);
+        return $this->staggerDelayMs;
     }
 
-    /**
-     * h=<n>@<delay>
-     *
-     * @return array{0:int,1:int,2:int|null}
-     */
-    public static function make(string $value): Hedge
+    public function cancelPolicy(): int
     {
-        $v = trim(Hedge::trimKey($value));
-        $pos = strpos($v, '@');
-        if ($pos === false) {
-            throw new \InvalidArgumentException('Invalid hedging format, expected n@delay or n@delay&policy: ' . $value);
-        }
-
-        $nToken = trim(substr($v, 0, $pos));
-        $delayToken = trim(substr($v, $pos + 1));
-
-        $n = (int)$nToken;
-        if ($n < 1) {
-            throw new \InvalidArgumentException('Hedge count must be >= 1: ' . $value);
-        }
-
-        // Optional "&<int>" cancellation policy after the delay token
-        $cancelPolicy = null;
-        $ampPos = strpos($delayToken, '&');
-        if ($ampPos !== false) {
-            $delayPart = trim(substr($delayToken, 0, $ampPos));
-            $cancelPart = trim(substr($delayToken, $ampPos + 1));
-
-            if ($cancelPart === '' || !ctype_digit($cancelPart)) {
-                throw new \InvalidArgumentException('Invalid cancellation policy, expected an integer after "&": ' . $value);
-            }
-
-            $delayMs = Duration::parseDurationMs($delayPart);
-            $cancelPolicy = (int)$cancelPart;
-        } else {
-            $delayMs = Duration::parseDurationMs($delayToken);
-        }
-
-        return new Hedge($n, $delayMs, $cancelPolicy);
+        return $this->cancelPolicy;
     }
 
+    /** Canonical value of h= (SPEC 6.4), without the key. */
+    public function canonical(): string
+    {
+        return $this->lanes . '@' . $this->staggerDelayMs
+            . ($this->cancelPolicy === self::CANCEL_ON_FIRST_COMPLETION ? '&1' : '');
+    }
 }

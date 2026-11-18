@@ -2,16 +2,14 @@
 
 namespace Gohany\Rtry\Impl;
 
-use Gohany\Rtry\Contracts\SleeperInterface;
+use Gohany\Retry\SleeperInterface;
 
 final class NativeSleeper implements SleeperInterface
 {
     public function sleepMs(int $milliseconds): void
     {
-        if ($milliseconds <= 0) {
-            return;
+        if ($milliseconds > 0) {
+            usleep($milliseconds * 1000);
         }
-
-        usleep($milliseconds * 1000);
     }
 }

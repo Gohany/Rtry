@@ -1,7 +1,14 @@
 {
   "name": "gohany/rtry",
   "description": "Retries with jittered backoff, Retry-After, deadlines, retry budgets and circuit breakers: an implementation of gohany/retry",
-  "keywords": ["rtry", "retry", "backoff", "jitter", "circuit breaker", "retry budget"],
+  "keywords": [
+    "rtry",
+    "retry",
+    "backoff",
+    "jitter",
+    "circuit breaker",
+    "retry budget"
+  ],
   "homepage": "https://github.com/Gohany/Rtry",
   "license": "MIT",
   "authors": [
@@ -15,7 +22,8 @@
     "gohany/retry": "^2.0",
     "psr/clock": "^1.0",
     "psr/http-message": "^1.0 || ^2.0",
-    "psr/log": "^1 || ^2 || ^3"
+    "psr/log": "^1 || ^2 || ^3",
+    "ext-ctype": "*"
   },
   "require-dev": {
     "phpunit/phpunit": "^11.5"

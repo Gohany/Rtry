@@ -1,367 +1,105 @@
 <?php declare(strict_types=1);
 
 namespace Gohany\Rtry\Tests;
+
 use Gohany\Retry\HedgeInterface;
 use Gohany\Retry\JitterInterface;
-use Gohany\Rtry\Impl\Parts\Attempts;
-use Gohany\Rtry\Impl\Parts\Base;
-use Gohany\Rtry\Impl\Parts\Cap;
-use Gohany\Rtry\Impl\Parts\Deadline;
-use Gohany\Rtry\Impl\Parts\Delay;
-use Gohany\Rtry\Impl\Parts\FollowHeaders;
+use Gohany\Retry\Testing\SeededRandom;
+use Gohany\Retry\Testing\TestAttemptContext;
+use Gohany\Retry\Testing\TestOutcome;
 use Gohany\Rtry\Impl\Parts\Hedge;
 use Gohany\Rtry\Impl\Parts\Jitter;
-use Gohany\Rtry\Impl\Parts\Mode;
 use Gohany\Rtry\Impl\Parts\On;
 use Gohany\Rtry\Impl\Parts\Sequence;
-use Gohany\Rtry\Impl\Parts\StartAfter;
-use Gohany\Rtry\Impl\Parts\Timeout;
-use Gohany\Rtry\Impl\RtryPolicyFactory;
+use Gohany\Rtry\Impl\RtryPolicy;
 use PHPUnit\Framework\TestCase;
 
-class RtryPartsTest extends TestCase
+final class RtryPartsTest extends TestCase
 {
-
-    private function freshPolicy(string $spec = 'rtry:m=lin;d=100'): object
+    public function testJitterParsesAndPrintsCanonically(): void
     {
-        // A minimal valid policy to apply parts onto.
-        $factory = new RtryPolicyFactory();
-        return $factory->fromSpec($spec);
+        self::assertSame('100%@full', Jitter::default()->canonical());
+        self::assertSame('20%@pm', Jitter::make('20%@PM')->canonical());
+        self::assertSame('12.5%@full', Jitter::make('12.5%')->canonical());
+        self::assertSame('1500@full', Jitter::make('1.5s')->canonical());
+        self::assertSame('none', Jitter::make('0')->canonical());
+        self::assertSame('none', Jitter::make('0%@pm')->canonical());
+        self::assertSame('none', Jitter::make('250@none')->canonical());
     }
 
-    // ===== Attempts =====
-    public function test_attempts_make_toString_and_apply(): void
+    public function testJitterDrawsOnceAndOnlyWhenTheBoundsDiffer(): void
     {
-        // Arrange
-        $part = Attempts::make('5');
-        $policy = $this->freshPolicy();
+        $jitter = Jitter::make('100@full');
+        $random = SeededRandom::randomizer(3);
 
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('a=5', (string)$part);
-        $this->assertSame(5, $policy->attempts());
+        self::assertSame(SeededRandom::expectedDraws(3, [[900, 1000]]), [$jitter->apply(1000, $random)]);
+        self::assertSame(SeededRandom::expectedDraws(3, [[0, 50]]), [$jitter->apply(50, SeededRandom::randomizer(3))], 'the window is clamped at 0');
+        self::assertSame(0, Jitter::default()->apply(0, SeededRandom::randomizer(3)));
+        self::assertSame(400, Jitter::none()->apply(400, SeededRandom::randomizer(3)));
+        self::assertSame(JitterInterface::MODE_PM, Jitter::percentOf(10, 'pm')->mode());
     }
 
-    // ===== Base (exponential) =====
-    public function test_base_make_toString_and_apply(): void
+    public function testJitterRejectsBadValues(): void
     {
-        // Arrange
-        $part = Base::make('2');
-        $policy = $this->freshPolicy('rtry:m=exp'); // switch to exponential
-
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('b=2', (string)$part);
-        $this->assertSame(2.0, $policy->exponentialBase());
-    }
-
-    // ===== Cap =====
-    public function test_cap_make_toString_and_apply(): void
-    {
-        // Arrange
-        $part = Cap::make('1.5s'); // 1500ms
-        $policy = $this->freshPolicy();
-
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('cap=1.5s', (string)$part);
-        $this->assertSame(1500, $policy->capMs());
-    }
-
-    // ===== Deadline =====
-    public function test_deadline_make_numeric_toString_and_apply(): void
-    {
-        // Arrange
-        $part = Deadline::make('2500'); // 2500ms
-        $policy = $this->freshPolicy();
-
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('dl=2.5s', (string)$part);
-        $this->assertSame(2500, $policy->deadlineBudgetMs());
-    }
-
-    // ===== Delay (linear) =====
-    public function test_delay_make_toString_and_apply(): void
-    {
-        // Arrange
-        $part = Delay::make('250ms');
-        $policy = $this->freshPolicy('rtry:m=lin;d=100'); // base has a delay already
-
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('d=250', (string)$part);
-        $this->assertSame(250, $policy->delayMs());
-    }
-
-    // ===== FollowHeaders =====
-    public function test_follow_headers_make_toString_and_apply(): void
-    {
-        // Arrange
-        $part = FollowHeaders::make('1');
-        $policy = $this->freshPolicy();
-
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('fh=1', (string)$part);
-        $this->assertTrue($policy->followHeaders());
-    }
-
-    // ===== Hedge =====
-    public function test_hedge_make_toString_and_apply(): void
-    {
-        // Arrange
-        $part = Hedge::make('3@100&1'); // lanes=3, stagger=100ms, cancel policy=1
-        $policy = $this->freshPolicy();
-
-        // Act
-        $part->applyToPolicy($policy);
-        $hedge = $policy->hedge();
-
-        // Assert
-        $this->assertSame('h=3@100&1', (string)$part);
-        $this->assertInstanceOf(HedgeInterface::class, $hedge);
-        $this->assertSame(3, $hedge->lanes());
-        $this->assertSame(100, $hedge->staggerDelayMs());
-        $this->assertSame('1', (string)$hedge->cancelPolicy());
-    }
-
-    public function test_hedge_make_toString_and_apply_strips_default_cancel_policy(): void
-    {
-        // Arrange
-        $part = Hedge::make('3@100&0'); // lanes=3, stagger=100ms, cancel policy=0
-        $policy = $this->freshPolicy();
-
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('h=3@100', (string)$part);
-    }
-
-    // ===== Jitter =====
-    public function test_jitter_make_toString_and_apply_percent_pm(): void
-    {
-        // Arrange
-        $part = Jitter::make('20%@pm');
-        $policy = $this->freshPolicy('rtry:m=lin;d=250;sa=1000');
-
-        // Act
-        $part->applyToPolicy($policy);
-        $jit = $policy->jitter();
-
-        // Assert
-        $this->assertSame('j=20%@pm', (string)$part);
-        $this->assertInstanceOf(JitterInterface::class, $jit);
-        $this->assertSame('pm', $jit->mode());
-        $this->assertSame(20.0, $jit->percent());
-        $this->assertNull($jit->windowMs());
-
-        // Deterministic sample with seed
-        $this->assertSame($part->apply(1000, 42), $jit->apply(1000, 42));
-    }
-
-    public function test_jitter_make_toString_and_apply_full_window(): void
-    {
-        // Arrange
-        $part = Jitter::make('100ms@full');
-        $policy = $this->freshPolicy('rtry:m=exp;b=2;sa=0');
-
-        // Act
-        $part->applyToPolicy($policy);
-        $jit = $policy->jitter();
-
-        // Assert
-        $this->assertSame('j=100', (string)$part);
-        $this->assertInstanceOf(JitterInterface::class, $jit);
-        $this->assertSame('full', $jit->mode());
-        $this->assertNull($jit->percent());
-        $this->assertSame(100, $jit->windowMs());
-        $this->assertSame($part->apply(500, 7), $jit->apply(500, 7));
-    }
-
-    // ===== Mode =====
-    public function test_mode_make_toString_and_apply_valid(): void
-    {
-        // Arrange
-        $part = Mode::make('seq');
-        $policy = $this->freshPolicy('rtry:m=lin;d=1');
-
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('m=seq', (string)$part);
-        $this->assertSame('seq', $policy->backoffMode());
-    }
-
-    public function test_mode_make_invalid_throws(): void
-    {
-        // Arrange
-        $this->expectException(\InvalidArgumentException::class);
-
-        // Act
-        Mode::make('oops'); // invalid
-    }
-
-    // ===== On =====
-    public function test_on_make_toString_and_apply_tokens(): void
-    {
-        // Arrange
-        $part = On::make('429,default');
-        $policy = $this->freshPolicy();
-
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('on=429,default', (string)$part);
-        // If the policy exposes tokens, assert them; otherwise just ensure no exception on apply.
-        if (method_exists($policy, 'retryOnTokens')) {
-            $this->assertSame(['429','default'], $policy->retryOnTokens());
+        foreach (['150%', '-5', 'abc', '20%@sideways', '%'] as $bad) {
+            try {
+                Jitter::make($bad);
+                self::fail('accepted j=' . $bad);
+            } catch (\InvalidArgumentException) {
+                self::assertTrue(true);
+            }
         }
     }
 
-    public function test_sequence_make_toString_and_iteration_with_repeat(): void
+    public function testSequenceForms(): void
     {
-        // Arrange
-        $part = Sequence::make('(50,100ms,1.5s*)');
-        $part2 = Sequence::make('seq=(50,100,1.5s,*)');
-
-        // Act
-        $string = (string)$part;
-
-        // Assert (string form + config)
-        $this->assertSame('seq=50,100,1.5s*', $string, 'Sequence __toString() should round/format and keep the trailing *');
-        $this->assertSame([50, 100, 1500], $part->delaysMs());
-        $this->assertTrue($part->isRepeatLastDelay());
-
-        // Arrange (iteration)
-        $part->reset();
-
-        // Act (+ Assert iteration behavior)
-        $this->assertSame(50,   $part->nextDelayMs());
-        $this->assertSame(100,  $part->nextDelayMs());
-        $this->assertSame(1500, $part->nextDelayMs());
-        // repeats last forever when '*' present
-        $this->assertSame(1500, $part->nextDelayMs());
-        $this->assertSame(1500, $part->nextDelayMs());
-
-        // Arrange (reset)
-        $part->reset();
-        // Act & Assert (re-iterate from beginning)
-        $this->assertSame(50, $part->nextDelayMs());
-
-        $this->assertSame([50, 100, 1500], $part2->delaysMs());
-        $this->assertTrue($part2->isRepeatLastDelay());
-        $this->assertSame('seq=50,100,1.5s*', (string)$part2);
+        foreach (['50,100,1.5s*', '(50,100ms,1.5s*)', '50,100,1.5s,*', '( 50 , 100 , 1.5s * )'] as $form) {
+            $sequence = Sequence::make($form);
+            self::assertSame([50, 100, 1500], $sequence->delaysMs(), $form);
+            self::assertTrue($sequence->isRepeatLastDelay(), $form);
+            self::assertSame('50,100,1500*', $sequence->canonical(), $form);
+        }
+        self::assertSame(1500, Sequence::make('50,100,1.5s*')->delayMsAt(9));
+        self::assertNull(Sequence::make('50,100')->delayMsAt(4));
     }
 
-    public function test_sequence_make_toString_and_iteration_without_repeat(): void
+    public function testSequenceRejectsEmptyForms(): void
     {
-        // Arrange
-        $part = Sequence::make('(25,75ms,200ms)');
-
-        // Act
-        $string = (string)$part;
-
-        // Assert (string form + config)
-        $this->assertSame('seq=25,75,200', $string);
-        $this->assertSame([25, 75, 200], $part->delaysMs());
-        $this->assertFalse($part->isRepeatLastDelay());
-
-        // Arrange (iteration)
-        $part->reset();
-
-        // Act & Assert (ends with null when no '*')
-        $this->assertSame(25,  $part->nextDelayMs());
-        $this->assertSame(75,  $part->nextDelayMs());
-        $this->assertSame(200, $part->nextDelayMs());
-        $this->assertNull($part->nextDelayMs());
-        $this->assertNull($part->nextDelayMs());
-    }
-
-    public function test_sequence_apply_to_policy_sets_sequence(): void
-    {
-        // Arrange
-        $policy = $this->freshPolicy('rtry:m=seq'); // use seq mode
-        $part   = Sequence::make('(10ms,20ms,*)');
-
-        // Act
-        $returned = $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame($policy, $returned, 'applyToPolicy should return the same policy instance');
-        // If policy exposes a getter, assert identity; otherwise just ensure no exception.
-        if (method_exists($policy, 'sequence')) {
-            $this->assertSame($part, $policy->sequence());
-        } elseif (method_exists($policy, 'toSpec')) {
-            $spec = (new RtryPolicyFactory())->fromSpec('rtry:m=seq')->toSpec(); // baseline
-            $this->assertIsString($spec, 'sanity check toSpec exists');
+        foreach (['', '()', '*', '50,,100'] as $bad) {
+            try {
+                Sequence::make($bad);
+                self::fail('accepted seq=' . $bad);
+            } catch (\InvalidArgumentException) {
+                self::assertTrue(true);
+            }
         }
     }
 
-    // ===== StartAfter =====
-
-    public function test_start_after_make_toString_and_apply_numeric_ms(): void
+    public function testHedgeIsParsedAsAHint(): void
     {
-        // Arrange
-        $part   = StartAfter::make('250');
-        $policy = $this->freshPolicy();
-
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('sa=250', (string)$part);
-        $this->assertSame(250, $policy->startAfterMs());
+        $hedge = Hedge::make('3@1.5s&1');
+        self::assertSame([3, 1500, HedgeInterface::CANCEL_ON_FIRST_COMPLETION], [$hedge->lanes(), $hedge->staggerDelayMs(), $hedge->cancelPolicy()]);
+        self::assertSame('3@1500&1', $hedge->canonical());
+        self::assertSame('2@100', Hedge::make('2@100&0')->canonical());
     }
 
-    public function test_start_after_make_toString_and_apply_with_units(): void
+    public function testOnBuildsATokenDecider(): void
     {
-        // Arrange
-        $part   = StartAfter::make('1.5s'); // 1500ms
-        $policy = $this->freshPolicy();
+        $on = On::make('5xx, 429 ,ETIMEDOUT');
+        self::assertSame(['5xx', '429', 'ETIMEDOUT'], $on->tokens());
+        self::assertSame('5xx,429,ETIMEDOUT', $on->canonical());
 
-        // Act
-        $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('sa=1.5s', (string)$part);
-        $this->assertSame(1500, $policy->startAfterMs());
+        $decider = $on->decider();
+        $attempt = new TestAttemptContext(1);
+        self::assertTrue($decider->shouldRetry(TestOutcome::failure(502), $attempt));
+        self::assertTrue($decider->shouldRetry(TestOutcome::failure(null, ['etimedout']), $attempt));
+        self::assertFalse($decider->shouldRetry(TestOutcome::failure(422), $attempt));
     }
 
-    // ===== Timeout =====
-
-    public function test_timeout_make_toString_and_apply(): void
+    public function testNominalDelaysDoNotOverflow(): void
     {
-        // Arrange
-        $part   = Timeout::make('2s'); // 2000ms
-        $policy = $this->freshPolicy();
-
-        // Act
-        $return = $part->applyToPolicy($policy);
-
-        // Assert
-        $this->assertSame('t=2s', (string)$part);
-        $this->assertSame($policy, $return, 'applyToPolicy should return the same policy instance');
-
-        // If the policy exposes a getter, assert it; otherwise we at least verify no exception was thrown.
-        if (method_exists($policy, 'attemptTimeoutMs')) {
-            $this->assertSame(2000, $policy->attemptTimeoutMs());
-        }
+        $policy = new RtryPolicy(attempts: 200, delayMs: 1000, exponentialBase: 10.0);
+        self::assertGreaterThan(0, $policy->nominalDelayMs(200));
+        self::assertSame(1_000_000, $policy->nominalDelayMs(5));
     }
-
 }
