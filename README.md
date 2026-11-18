@@ -91,7 +91,7 @@ Rtry turns a thrown error into a status and tags with a `RuleBasedFailureClassif
   (SMTP's 421, a driver's 409), so it never silences the tags below.
 - **Tags come only from transport and deadlock evidence:** `ETIMEDOUT`, `ECONNRESET`,
   `ECONNREFUSED` and `NETWORK_ERROR` from `Psr\Http\Client\NetworkExceptionInterface`,
-  Symfony HttpClient's `TransportExceptionInterface`, a cURL error number (`cURL error 28`)
+  Symfony HttpClient's `TransportExceptionInterface`, a cURL error number (`cURL error 28`),
   an errno name (`connect ECONNREFUSED 127.0.0.1:6379`), or a specific phrase such as
   "connection refused", "timed out", "connection reset" or a driver's timeout (PostgreSQL's
   "canceling statement due to statement timeout", MongoDB's "socket error or timeout",
@@ -177,11 +177,12 @@ above `cap` (gohany/retry SPEC 5.11). `fh=0` ignores the headers.
   in the same millisecond, so Rtry adds the policy's jitter window for that attempt on top: with
   full jitter and a 100 ms backoff, `Retry-After: 2` waits between 2000 and 2100 ms. `j=0`
   waits exactly what the server said. When the server's wait fits inside `dl`, the spread
-  never pushes it past `dl` (on the durable path, pass the attempt's context to `fromError()`
-  for this; see below).
+  never pushes it past `dl` (on the durable path, build the outcome with the scheduler's
+  `outcome()` and the attempt's context; see below).
 - **Bounded.** A wait past `dl` gives up with `DeadlineExceeded` without sleeping. So does a
   wait longer than a day (`RtryScheduler::MAX_HEADER_WAIT_MS`; pass another ceiling to
-  `RtryScheduler`'s constructor for durable retries that should wait longer). The server's
+  `RtryScheduler`'s constructor for durable retries that should wait longer, and build their
+  outcomes with that scheduler's `outcome()` so the spread knows the same ceiling). The server's
   wait decides, not the jitter: `Retry-After: 86400` waits exactly a day with or without
   jitter, and `86401` gives up either way. A header asking
   for a year, a number too large for PHP, a negative or malformed value, or a word such as
@@ -214,9 +215,9 @@ $scheduler = new RtryScheduler();
 // $remainingMs is what is left of your dl, or null without one.
 $context = new RtryAttemptContext($job->attempts, $policy->attempts(), 0, 0, $remainingMs);
 
-// Passing the policy and attempt spreads rows told the same Retry-After above it; passing
-// the context keeps that spread inside dl.
-$outcome = RtryAttemptOutcome::fromError($error, $policy->failureClassifier(), null, $policy, $job->attempts, null, $context);
+// outcome() classifies $error with the policy's classifier and spreads rows told the same
+// Retry-After above it, inside dl and inside this scheduler's ceiling.
+$outcome = $scheduler->outcome($error, $policy, $context);
 $decision = $scheduler->next($policy, $outcome, $context);
 
 if ($decision->retry()) {
@@ -228,6 +229,13 @@ if ($decision->retry()) {
 
 Leave the scheduler's `Randomizer` unset in production: each process gets its own unseeded
 one. A seed shared by many workers makes them retry in step.
+
+`outcome()` takes the clock, the randomness and the ceiling (`maxHeaderWaitMs`) from the
+scheduler, and the attempt number from the context, so each is set once. It replaces
+`RtryAttemptOutcome::fromError()`, which still works, but needs a ceiling other than the
+default day passed to it as well as to the scheduler: given to the scheduler alone, a week-long
+ceiling drops the spread above a two-day `Retry-After`, and an hour-long one gives up on a
+`Retry-After: 3600` it should honour.
 
 ## Retry budgets and circuit breakers
 
@@ -259,6 +267,35 @@ failed, or another worker opened it meanwhile), the run ends at once and `try()`
 failure; it does not sleep toward a retry the breaker would refuse, and it spends no budget
 token. A failure the policy does not retry, such as a 404, counts as a success for the
 breaker: the service answered.
+
+That default reads the policy, not the service. A refused connection under `on=5xx` is not
+retried, so it counts as a success too, and the circuit never opens however many there are; a
+404 retried under `on=default,404` counts as a failure. To tell the breaker what happened to
+the service instead, give `withGuard()` a verdict:
+
+```php
+use Gohany\Rtry\Impl\Breaker\CircuitBreaker;
+use Gohany\Rtry\Impl\Breaker\InMemoryCircuitBreakerStore;
+use Gohany\Rtry\Impl\Breaker\ServiceFailureVerdict;
+use Gohany\Rtry\Impl\NativeClock;
+use Gohany\Rtry\Impl\Retry;
+use Gohany\Rtry\Impl\RtryPolicyFactory;
+
+$clock = new NativeClock();
+$breaker = new CircuitBreaker(new InMemoryCircuitBreakerStore($clock), $clock, failureThreshold: 5, windowMs: 10_000, openMs: 30_000);
+
+$retry = (new Retry($clock))->withGuard('search-api', null, $breaker, new ServiceFailureVerdict());
+$results = $retry->try(fn ($attempt) => $client->get($url), (new RtryPolicyFactory())->fromSpec('rtry:a=3;d=100;on=5xx'));
+```
+
+`ServiceFailureVerdict` counts a 408, 429 or 5xx, and the transport tags `ETIMEDOUT`,
+`ECONNRESET`, `ECONNREFUSED`, `NETWORK_ERROR` (and `RATE_LIMITED`), as a failure, whatever
+the policy retries. Everything else (a 404, a 422, a `DEADLOCK`) is a success. Add the tags
+your own rules set for "never answered":
+`new ServiceFailureVerdict([...ServiceFailureVerdict::UNAVAILABLE_TAGS, 'SDK_TRANSPORT'])`,
+or implement `Contracts\BreakerVerdictInterface`. The verdict changes only what the breaker is
+told: retries, sleeps and give-up reasons are the policy's. A verdict that throws falls back to
+the default for that attempt and is logged as `retry.guard_error` with `call` `verdict`.
 
 ### When a guard's store fails
 

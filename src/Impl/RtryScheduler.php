@@ -8,8 +8,10 @@ use Gohany\Retry\GiveUpReason;
 use Gohany\Retry\RetryDecision;
 use Gohany\Retry\RetryPolicyInterface;
 use Gohany\Retry\RetrySchedulerInterface;
+use Gohany\Rtry\Contracts\FailureClassifierInterface;
 use Psr\Clock\ClockInterface;
 use Random\Randomizer;
+use Throwable;
 
 /**
  * SPEC 5.11: "retry after N ms" or "give up, because ...", never sleeping. Retry uses it
@@ -23,8 +25,9 @@ use Random\Randomizer;
  * $maxHeaderWaitMs (a day by default). A longer one gives up with DeadlineExceeded instead of
  * sleeping or scheduling it: no in-process caller should sleep that long, and a header asking
  * for a year is more likely a bug than a plan. Durable callers that do want longer pass more.
- * Retry and RtryAttemptOutcome::fromError() keep their jitter spread under the ceiling, so a
- * wait of exactly the ceiling is honoured with or without jitter.
+ * Retry and outcome() keep their jitter spread under the ceiling, so a wait of exactly the
+ * ceiling is honoured with or without jitter. Durable callers: build the outcome with this
+ * scheduler's outcome(), so the ceiling is set in one place.
  */
 final class RtryScheduler implements RetrySchedulerInterface
 {
@@ -50,6 +53,34 @@ final class RtryScheduler implements RetrySchedulerInterface
     public function maxHeaderWaitMs(): int
     {
         return $this->maxHeaderWaitMs;
+    }
+
+    /**
+     * Classifies an error the attempt numbered $context->attemptNumber() threw into the outcome
+     * to pass to next(), for a durable retry. The one place a durable caller sets the ceiling,
+     * the clock and the randomness: this scheduler's. A server's Retry-After is spread above,
+     * never below, by the policy's jitter window for the next attempt, never past the context's
+     * remainingBudgetMs() (dl) or this scheduler's ceiling when the server's own wait fits them.
+     *
+     * $classifier defaults to the policy's (RtryPolicy::failureClassifier()), else Rtry's default.
+     */
+    public function outcome(
+        Throwable $error,
+        RetryPolicyInterface $policy,
+        AttemptContextInterface $context,
+        ?FailureClassifierInterface $classifier = null,
+    ): RtryAttemptOutcome {
+        $classifier ??= $policy instanceof RtryPolicy ? $policy->failureClassifier() : RuleBasedFailureClassifier::default();
+        return RtryAttemptOutcome::fromError(
+            $error,
+            $classifier,
+            $this->clock,
+            $policy,
+            $context->attemptNumber(),
+            $this->random,
+            $context,
+            $this->maxHeaderWaitMs,
+        );
     }
 
     /**

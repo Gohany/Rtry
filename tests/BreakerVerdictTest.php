@@ -210,7 +210,7 @@ final class BreakerVerdictTest extends TestCase
         $breaker->recordFailure('api');
         $this->clock->advanceMs(5_000);
 
-        [$result] = $this->runGuarded($this->retry()->withGuard('api', null, $breaker, new ServiceFailureVerdict()), 'rtry:a=3', static fn () => 'ok');
+        [$result] = $this->runGuarded($this->retry()->withGuard('api', null, $breaker, new ServiceFailureVerdict()), 'rtry:a=3;d=100', static fn () => 'ok');
 
         self::assertSame('ok', $result->value());
         self::assertSame(CircuitState::Closed, $breaker->state('api'));
@@ -352,6 +352,40 @@ final class BreakerVerdictTest extends TestCase
     {
         self::assertFalse((new ServiceFailureVerdict())->isServiceFailure(RtryAttemptOutcome::success('ok')));
         self::assertFalse((new ServiceFailureVerdict())->isServiceFailure(TestOutcome::success()));
+
+        // An outcome of your own that succeeded but kept its 503 is still no failure.
+        $succeededWithAStatus = new class implements AttemptOutcomeInterface {
+            public function isSuccess(): bool
+            {
+                return true;
+            }
+
+            public function result(): mixed
+            {
+                return 'ok';
+            }
+
+            public function error(): ?\Throwable
+            {
+                return null;
+            }
+
+            public function statusCode(): ?int
+            {
+                return 503;
+            }
+
+            public function tags(): array
+            {
+                return ['ETIMEDOUT'];
+            }
+
+            public function notBeforeUnixMs(): ?int
+            {
+                return null;
+            }
+        };
+        self::assertFalse((new ServiceFailureVerdict())->isServiceFailure($succeededWithAStatus));
     }
 
     public function testItReadsTheDefaultClassifiersOutcomes(): void

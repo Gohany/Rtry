@@ -41,7 +41,9 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
 
     /**
      * Classifies a caught error (status, tags, Retry-After), for callers that schedule a
-     * durable retry with RtryScheduler::next() instead of running Retry.
+     * durable retry with RtryScheduler::next() instead of running Retry. Prefer
+     * RtryScheduler::outcome(): it passes the scheduler's clock, randomness and ceiling, the
+     * attempt number and the policy's classifier for you, so none of them is set twice.
      *
      * Pass the policy and the failed attempt's number so a server's Retry-After is spread
      * above, never below (RtryScheduler::headerSpreadMs()): rows told the same Retry-After
@@ -51,7 +53,8 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
      * fits inside its remainingBudgetMs() (dl), the spread then stays inside it, as in Retry.
      * Without it the spread can push a wait that fits past dl, and next() gives up. The spread
      * also never pushes a wait that fits the scheduler's ceiling past it; pass
-     * $maxHeaderWaitMs when your RtryScheduler has a ceiling other than the default day.
+     * $maxHeaderWaitMs when your RtryScheduler has a ceiling other than the default day, or the
+     * spread can push a wait that fits it over (a give-up) or be dropped at a longer one.
      */
     public static function fromError(
         Throwable $error,

@@ -2,7 +2,40 @@
 
 ## Unreleased
 
-Planned as 2.3.0. No change to the gohany/retry interfaces and no method removed; every
+Planned as 2.4.0. Additive: no change for 2.3 callers that do not use the new arguments, and
+none to the gohany/retry interfaces.
+
+### Added
+
+- **A breaker verdict.** `Retry::withGuard()` takes an optional fourth argument, a
+  `Contracts\BreakerVerdictInterface`. With one, each failed attempt tells the breaker what
+  happened to the service, whatever the policy retries. Without one, as before, a failure the
+  policy does not retry is a success for the breaker and one it retries is a failure, so a
+  refused connection under `on=5xx` never opened the circuit, and a half-open probe that failed
+  that way closed it. `Breaker\ServiceFailureVerdict` counts a 408, 429 or 5xx and the tags
+  `ETIMEDOUT`, `ECONNRESET`, `ECONNREFUSED`, `NETWORK_ERROR` and `RATE_LIMITED`; pass more tags
+  (`[...ServiceFailureVerdict::UNAVAILABLE_TAGS, 'SDK_TRANSPORT']`) for your own rules. The
+  verdict never changes a retry, a sleep or a give-up reason. One that throws falls back to the
+  default for that attempt and is logged as `retry.guard_error` with `call` `verdict`.
+- **`RtryScheduler::outcome($error, $policy, $context, $classifier = null)`** builds the
+  outcome for `next()` on the durable path from the scheduler's own clock, randomness and
+  ceiling, the context's attempt number and `dl`, and the policy's classifier. With a ceiling
+  set on the scheduler alone, `RtryAttemptOutcome::fromError()` assumed a day: a week-long
+  ceiling dropped the spread above a two-day `Retry-After`, and an hour-long one gave up on a
+  `Retry-After: 3600`. `fromError()` is unchanged; the README's durable example now uses
+  `outcome()`.
+
+### Tests
+
+- Twelve 2.3.0 edges that were right but untested are pinned: a Laravel response whose
+  `headers()` throws, a status below 100 on its `$response`, `getResponse()` read before
+  `$response`, `RATE_LIMITED` on a 408 and a 599 and not on a 600, `X-RateLimit-Remaining: 1`
+  and a non-numeric remaining count, "lock timeout" in a `RuntimeException` message, an errno
+  name with a letter on either side, and `fromError()`'s ceiling argument.
+
+## 2.3.0 — 2026-11-18
+
+No change to the gohany/retry interfaces and no method removed; every
 constructor and method change is an optional argument. Some behaviour changes on purpose. Each
 is a fix for a failure that retried when it should not have, or the reverse. They are listed
 under Changed so you can check them against your specs.
@@ -10,7 +43,7 @@ under Changed so you can check them against your specs.
 ### Changed
 
 - **A status read from an HTTP response decides, wherever it sits on the error.** Rtry looks
-  along the `getPrevious()` chain for a response (`getResponse()`, PSR-7 or Symfony-shaped)
+  along the `getPrevious()` chain for a response (`getResponse()`, PSR-7 or Symfony-shaped),
   Laravel's `RequestException` `$response` property (`status()`, `headers()`), or a status
   accessor (`getStatusCode()`, `getHttpStatus()`, `getHttpStatusCode()`). A
   retryable status (408, 429, 5xx) keeps the error's transport tags, as in 2.2. Any other

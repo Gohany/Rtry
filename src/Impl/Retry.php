@@ -11,6 +11,7 @@ use Gohany\Retry\RetryerInterface;
 use Gohany\Retry\RetryPolicyInterface;
 use Gohany\Retry\RetryResultInterface;
 use Gohany\Retry\SleeperInterface;
+use Gohany\Rtry\Contracts\BreakerVerdictInterface;
 use Gohany\Rtry\Contracts\FailureClassifierInterface;
 use Gohany\Rtry\Contracts\RetryHooksInterface;
 use Psr\Clock\ClockInterface;
@@ -25,7 +26,8 @@ use Throwable;
  *   tryOutcome() returns a RetryResult that also says why it stopped.
  * - Delays come from RtryScheduler: backoff, cap, jitter, Retry-After, deadline.
  * - Time comes from the one injected PSR-20 clock; waits go through the SleeperInterface.
- * - withGuard() adds a retry budget and/or circuit breaker for one downstream key. A failure
+ * - withGuard() adds a retry budget and/or circuit breaker for one downstream key, and
+ *   optionally a verdict on what each failure tells the breaker. A failure
  *   that leaves the circuit open ends the run at once, without sleeping toward a retry the
  *   breaker would refuse. A guard that throws (its store is down) never replaces the
  *   operation's own value or error: the breaker fails open, the budget fails closed, a
@@ -47,6 +49,7 @@ final class Retry implements RetryerInterface, RetryHooksInterface
     private ?string $guardKey = null;
     private ?RetryBudgetInterface $budget = null;
     private ?CircuitBreakerInterface $breaker = null;
+    private ?BreakerVerdictInterface $verdict = null;
 
     /** @var null|callable */
     private $betweenHook = null;
@@ -73,12 +76,21 @@ final class Retry implements RetryerInterface, RetryHooksInterface
     /**
      * A copy that also consults a retry budget and/or a circuit breaker under $key, usually
      * one downstream service. The budget is asked before each retry and credited on success;
-     * the breaker is asked before each attempt and told each attempt's result. A failure the
-     * policy does not retry (a 4xx, say) counts as a success for the breaker: the service
-     * answered.
+     * the breaker is asked before each attempt and told each attempt's result.
+     *
+     * Without $verdict, a failure the policy does not retry (a 4xx, say) counts as a success
+     * for the breaker (the service answered) and one it retries as a failure. With one, the
+     * verdict alone decides what each failed attempt tells the breaker, whatever the policy
+     * retries: ServiceFailureVerdict counts transport errors, 408, 429 and 5xx, so a refused
+     * connection under on=5xx still opens the circuit and a 404 retried under on=default,404
+     * does not. The verdict never changes the retries, sleeps or give-up reasons.
      */
-    public function withGuard(string $key, ?RetryBudgetInterface $budget = null, ?CircuitBreakerInterface $breaker = null): self
-    {
+    public function withGuard(
+        string $key,
+        ?RetryBudgetInterface $budget = null,
+        ?CircuitBreakerInterface $breaker = null,
+        ?BreakerVerdictInterface $verdict = null,
+    ): self {
         if ($key === '') {
             throw new \InvalidArgumentException('A guard key cannot be empty');
         }
@@ -86,6 +98,7 @@ final class Retry implements RetryerInterface, RetryHooksInterface
         $clone->guardKey = $key;
         $clone->budget = $budget;
         $clone->breaker = $breaker;
+        $clone->verdict = $verdict;
         return $clone;
     }
 
@@ -171,7 +184,7 @@ final class Retry implements RetryerInterface, RetryHooksInterface
                     'tags' => $outcome->tags(),
                 ]);
 
-                $this->report('breaker', $reason === GiveUpReason::NotRetryable ? 'recordSuccess' : 'recordFailure');
+                $this->report('breaker', $this->isServiceFailure($outcome, $reason) ? 'recordFailure' : 'recordSuccess');
 
                 // A circuit open now (this failure opened it, a probe failed, or another worker
                 // opened it) would refuse the retry: give up without sleeping first.
@@ -232,6 +245,25 @@ final class Retry implements RetryerInterface, RetryHooksInterface
         } catch (Throwable $e) {
             $this->guardError('breaker', 'state', $e);
             return false;
+        }
+    }
+
+    /**
+     * What a failed attempt tells the breaker: the verdict's answer when withGuard() was given
+     * one, otherwise whether the policy retries it. A verdict that throws falls back to the
+     * policy's answer and is logged as retry.guard_error (call "verdict").
+     */
+    private function isServiceFailure(RtryAttemptOutcome $outcome, ?GiveUpReason $reason): bool
+    {
+        $retried = $reason !== GiveUpReason::NotRetryable;
+        if ($this->breaker === null || $this->verdict === null) {
+            return $retried;
+        }
+        try {
+            return $this->verdict->isServiceFailure($outcome);
+        } catch (Throwable $e) {
+            $this->guardError('breaker', 'verdict', $e);
+            return $retried;
         }
     }
 
