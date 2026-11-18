@@ -2,6 +2,7 @@
 
 namespace Gohany\Rtry\Impl;
 
+use Gohany\Retry\AttemptContextInterface;
 use Gohany\Retry\AttemptOutcomeInterface;
 use Gohany\Retry\RetryPolicyInterface;
 use Gohany\Rtry\Contracts\FailureClassifierInterface;
@@ -45,6 +46,12 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
      * Pass the policy and the failed attempt's number so a server's Retry-After is spread
      * above, never below (RtryScheduler::headerSpreadMs()): rows told the same Retry-After
      * then do not all come due in the same millisecond. Leave $random null in production.
+     *
+     * Pass the context you will give RtryScheduler::next() too: when the server's own time
+     * fits inside its remainingBudgetMs() (dl), the spread then stays inside it, as in Retry.
+     * Without it the spread can push a wait that fits past dl, and next() gives up. The spread
+     * also never pushes a wait that fits the scheduler's ceiling past it; pass
+     * $maxHeaderWaitMs when your RtryScheduler has a ceiling other than the default day.
      */
     public static function fromError(
         Throwable $error,
@@ -53,6 +60,8 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
         ?RetryPolicyInterface $policy = null,
         int $failedAttempt = 1,
         ?Randomizer $random = null,
+        ?AttemptContextInterface $context = null,
+        int $maxHeaderWaitMs = RtryScheduler::MAX_HEADER_WAIT_MS,
     ): self {
         $metadata = ($classifier ?? RuleBasedFailureClassifier::default())->classify($error);
         $now = Clock::nowMs($clock ?? new NativeClock());
@@ -60,9 +69,12 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
         if ($policy === null) {
             return $outcome;
         }
+        $remaining = $context?->remainingBudgetMs();
         return $outcome->spreadAboveServerTime(
             $now,
             RtryScheduler::headerSpreadMs($policy, $failedAttempt, $random ?? new Randomizer()),
+            $remaining === null ? null : $now + HeaderWaits::clampDelta($remaining),
+            $maxHeaderWaitMs,
         );
     }
 
@@ -87,13 +99,15 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
 
     /**
      * This failure with its server time moved $spreadMs later, when the server named a time
-     * still ahead of $nowUnixMs, but never to or past $deadlineUnixMs when the server's own
-     * time is before it. Otherwise this failure unchanged.
+     * still ahead of $nowUnixMs. The spread never moves it to or past $deadlineUnixMs when the
+     * server's own time is before it, and never past $nowUnixMs + $maxWaitMs when the server's
+     * own wait is within that ceiling: whether a wait fits dl or the ceiling is decided by the
+     * server's time, never by jitter. Otherwise this failure unchanged.
      *
      * @internal Retry and fromError() use it; gohany/retry SPEC 5.11 has the scheduler take
      *           max(delay, notBefore - now), so the spread is applied to notBefore.
      */
-    public function spreadAboveServerTime(int $nowUnixMs, int $spreadMs, ?int $deadlineUnixMs = null): self
+    public function spreadAboveServerTime(int $nowUnixMs, int $spreadMs, ?int $deadlineUnixMs = null, ?int $maxWaitMs = null): self
     {
         $notBefore = $this->notBeforeUnixMs;
         if ($this->success || $notBefore === null || $notBefore <= $nowUnixMs || $spreadMs <= 0) {
@@ -102,6 +116,10 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
         $spread = min($spreadMs, HeaderWaits::MAX_EPOCH_MS - $notBefore);
         if ($deadlineUnixMs !== null && $notBefore < $deadlineUnixMs) {
             $spread = min($spread, $deadlineUnixMs - 1 - $notBefore);
+        }
+        if ($maxWaitMs !== null) {
+            // Over the ceiling already: this goes negative and the scheduler gives up anyway.
+            $spread = min($spread, $nowUnixMs + HeaderWaits::clampDelta($maxWaitMs) - $notBefore);
         }
         if ($spread <= 0) {
             return $this;

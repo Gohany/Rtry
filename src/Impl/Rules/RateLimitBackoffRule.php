@@ -17,12 +17,15 @@ use Gohany\Rtry\Impl\HeaderWaits;
  * - Retry-After, on any response: delay seconds, or an HTTP date (IMF-fixdate, RFC 850,
  *   asctime, or "Day, DD Mon YYYY HH:MM:SS" with a zone). Words such as "tomorrow" are not
  *   dates here.
- * - On a 429 or a 503 only: RateLimit-Reset-After / X-RateLimit-Reset-After (delta seconds),
- *   X-RateLimit-Reset-Ms (epoch ms), RateLimit-Reset / X-RateLimit-Reset (delta seconds below
- *   10^9, otherwise epoch seconds, or epoch ms from 10^12). Many APIs send these on every
- *   response, so on any other status they are not a wait and not a sign of rate limiting.
+ * - RateLimit-Reset-After / X-RateLimit-Reset-After (delta seconds), X-RateLimit-Reset-Ms
+ *   (epoch ms), RateLimit-Reset / X-RateLimit-Reset (delta seconds below 10^9, otherwise epoch
+ *   seconds, or epoch ms from 10^12), only on a 429, a 503, or a response whose
+ *   RateLimit-Remaining / X-RateLimit-Remaining is 0. Many APIs send these on every response,
+ *   so with quota left they are not a wait and not a sign of rate limiting.
  *
- * Tags RATE_LIMITED on a 429 or a 503 that carries one of these headers, never elsewhere.
+ * Tags RATE_LIMITED when one of these waits is found on a status that can say "rate limited":
+ * 403 (GitHub's primary and secondary limits), 408, 429 or 5xx. Never on another 4xx (a 404 or
+ * a 422 with Retry-After still runs once) and never below 400.
  * Values are parsed defensively: a huge, negative, NaN or malformed value never warns or
  * throws; a huge one is pinned to HeaderWaits' bounds and the scheduler gives up on it.
  */
@@ -53,8 +56,8 @@ final class RateLimitBackoffRule implements RuleInterface
         }
 
         $status = $response->statusCode;
-        $rateLimited = $status === 429 || $status === 503;
-        $hint = self::retryAfter($headers) ?? ($rateLimited ? self::resetHeaders($headers) : null);
+        $resetCounts = $status === 429 || $status === 503 || self::quotaExhausted($headers);
+        $hint = self::retryAfter($headers) ?? ($resetCounts ? self::resetHeaders($headers) : null);
         if ($hint === null) {
             return null;
         }
@@ -62,13 +65,35 @@ final class RateLimitBackoffRule implements RuleInterface
 
         return new FailureMetadata(
             $status >= 400 && $status <= 599 ? $status : null,
-            $rateLimited ? [FailureToken::RATE_LIMITED] : [],
+            self::canSayRateLimited($status) ? [FailureToken::RATE_LIMITED] : [],
             [],
             $minNextDelayMs,
             $notBeforeUnixMs,
             [$key => [$headers[$key]]],
             fromResponse: true,
         );
+    }
+
+    /** A status a server uses to say "rate limited": 403 (GitHub), 408, 429 or 5xx. */
+    private static function canSayRateLimited(int $status): bool
+    {
+        return $status === 403 || $status === 408 || $status === 429 || ($status >= 500 && $status <= 599);
+    }
+
+    /**
+     * RateLimit-Remaining or X-RateLimit-Remaining is 0: the limit has been hit, so a reset
+     * header on this response is a wait (GitHub's 403 with X-RateLimit-Remaining: 0).
+     *
+     * @param array<string, string> $headers
+     */
+    private static function quotaExhausted(array $headers): bool
+    {
+        foreach (['ratelimit-remaining', 'x-ratelimit-remaining'] as $k) {
+            if (isset($headers[$k]) && is_numeric($headers[$k]) && (float) $headers[$k] <= 0.0) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

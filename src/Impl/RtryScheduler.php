@@ -23,6 +23,8 @@ use Random\Randomizer;
  * $maxHeaderWaitMs (a day by default). A longer one gives up with DeadlineExceeded instead of
  * sleeping or scheduling it: no in-process caller should sleep that long, and a header asking
  * for a year is more likely a bug than a plan. Durable callers that do want longer pass more.
+ * Retry and RtryAttemptOutcome::fromError() keep their jitter spread under the ceiling, so a
+ * wait of exactly the ceiling is honoured with or without jitter.
  */
 final class RtryScheduler implements RetrySchedulerInterface
 {
@@ -42,6 +44,12 @@ final class RtryScheduler implements RetrySchedulerInterface
         }
         $this->clock = $clock ?? new NativeClock();
         $this->random = $random ?? new Randomizer();
+    }
+
+    /** The longest server-requested wait this scheduler honours; a longer one gives up. */
+    public function maxHeaderWaitMs(): int
+    {
+        return $this->maxHeaderWaitMs;
     }
 
     /**

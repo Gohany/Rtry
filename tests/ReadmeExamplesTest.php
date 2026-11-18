@@ -47,6 +47,7 @@ final class ReadmeExamplesTest extends TestCase
             'now' => new \DateTimeImmutable('2026-11-17 12:00:00'),
             'error' => HttpFailure::status(503),
             'logger' => new NullLogger(),
+            'remainingMs' => 30_000,
         ];
 
         $run = static function (string $__code, array $__vars): void {

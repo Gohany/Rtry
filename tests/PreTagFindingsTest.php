@@ -126,6 +126,14 @@ final class PreTagFindingsTest extends TestCase
         self::assertSame([], $this->sleeps);
     }
 
+    public function testListingA4xxInOnRetriesItAndStillWaitsItsRetryAfter(): void
+    {
+        // The CHANGELOG's way back for a 4xx other than 403 that sends Retry-After.
+        $error = HttpFailure::status(423, ['Retry-After' => '2']);
+        self::assertSame([4, GiveUpReason::AttemptsExhausted], $this->attempt('rtry:a=4;d=100;j=0;on=default,423', $error));
+        self::assertSame([2000, 2000, 2000], $this->sleeps);
+    }
+
     public function testRateLimitedIsStillNeverTaggedBelow400(): void
     {
         foreach ([200, 302, 399] as $status) {
@@ -356,6 +364,18 @@ final class PreTagFindingsTest extends TestCase
             $decision = (new RtryScheduler($clock, null, $week))->next($policy, $outcome, $context);
             self::assertSame($week, $decision->delayMs(), "seed $seed");
         }
+    }
+
+    public function testAHugeBudgetOrCeilingOnTheDurablePathNeverOverflows(): void
+    {
+        $policy = (new RtryPolicyFactory())->fromSpec('rtry:a=8;d=100;j=0');
+        $clock = new FrozenClock();
+        $context = new RtryAttemptContext(1, $policy->attempts(), 0, 0, PHP_INT_MAX);
+        $error = HttpFailure::status(503, ['Retry-After' => '2']);
+
+        $outcome = RtryAttemptOutcome::fromError($error, null, $clock, $policy, 1, SeededRandom::randomizer(7), $context, PHP_INT_MAX);
+        self::assertSame($clock->nowUnixMs() + 2000, $outcome->notBeforeUnixMs());
+        self::assertSame(2000, (new RtryScheduler($clock, null, PHP_INT_MAX))->next($policy, $outcome, $context)->delayMs());
     }
 
     // ---- finding 6: the five surviving mutations --------------------------------------------

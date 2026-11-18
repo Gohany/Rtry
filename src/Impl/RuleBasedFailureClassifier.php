@@ -22,8 +22,10 @@ use Gohany\Rtry\Impl\Rules\ResponseStatusRule;
  *   2.x. It never silences tags: SMTP's 421 and a driver's 409 are codes from that range.
  * - Tags come only from transport and deadlock evidence: transport types (PSR-18
  *   NetworkExceptionInterface, Symfony HttpClient TransportExceptionInterface), a cURL error
- *   number, deadlock SQLSTATEs and vendor codes, and specific phrases ("connection refused",
- *   "timed out", "deadlock found"), never a bare word such as "timeout" or "refused". A
+ *   number, deadlock SQLSTATEs and vendor codes, errno names (ECONNREFUSED, ETIMEDOUT,
+ *   ECONNRESET), and specific phrases ("connection refused", "timed out", "deadlock found",
+ *   driver timeouts such as PostgreSQL's "canceling statement due to statement timeout"),
+ *   never a bare word such as "timeout" or "refused". A
  *   LogicException or an \Error (TypeError, ValueError) is a bug or a validation error: its
  *   message is never read for tags.
  * - Tags from rules you add are kept whatever the status.
@@ -37,6 +39,11 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
         'timed out', 'timeout was reached', 'timeout reached', 'timeout exceeded', 'timeout expired',
         'timeout waiting', 'connection timeout', 'read timeout', 'request timeout', 'gateway timeout',
         'socket timeout',
+        'due to statement timeout',  // PostgreSQL 57014, statement_timeout
+        'due to lock timeout',       // PostgreSQL 55P03, lock_timeout
+        'socket error or timeout',   // MongoDB
+        'timeout occurred',          // Oracle ORA-12170 "TNS:Connect timeout occurred", libmemcached
+        'i/o timeout',               // Go net ("dial tcp ...: i/o timeout")
     ];
     private const RESET_PHRASES = ['connection reset', 'connection was reset'];
     /** Not "refused" alone: "payment refused" and "consent refused" are not transport errors. */
@@ -45,9 +52,16 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
     private const DEADLOCK_PHRASES = [
         'deadlock',                    // "deadlock detected/found/victim"
         'lock wait timeout exceeded',  // MySQL InnoDB
+        'due to lock timeout',         // PostgreSQL 55P03
         'database is locked',          // SQLite
         'could not serialize access',  // PostgreSQL
         'serialization failure',       // SQL standard / PostgreSQL
+    ];
+    /** errno names as Node.js, libuv and many drivers print them ("connect ECONNREFUSED 127.0.0.1:6379"). */
+    private const ERRNO_NAMES = [
+        'etimedout' => FailureToken::ETIMEDOUT,
+        'econnrefused' => FailureToken::ECONNREFUSED,
+        'econnreset' => FailureToken::ECONNRESET,
     ];
     /** cURL error numbers ("cURL error 28: ...") that mean the request never got a response. */
     private const CURL_ERRORS = [
@@ -271,6 +285,11 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
             }
             if ($this->containsAny($message, self::NETWORK_PHRASES)) {
                 $tags[] = FailureToken::NETWORK_ERROR;
+            }
+            foreach (self::ERRNO_NAMES as $name => $token) {
+                if (preg_match('~\b' . $name . '\b~', $message)) {
+                    $tags[] = $token;
+                }
             }
             if (preg_match('~\bcurl error (\d+)~', $message, $m) && isset(self::CURL_ERRORS[(int) $m[1]])) {
                 $tags[] = self::CURL_ERRORS[(int) $m[1]];
