@@ -176,6 +176,56 @@ Redis or Valkey needs no multi-key script.
 
 Retrying a call with side effects (a payment, a webhook) needs an idempotency key on the call.
 
+### Watching the breaker open and close
+
+Pass `onTransition` to log, count or alert on each change of a circuit's state. It runs once per
+change (closed → open, open → half-open, half-open → closed or open), never per call, with a
+`CircuitTransition`: the key, the state before and after, and the time from the breaker's clock.
+
+```php
+use Gohany\Rtry\Impl\Breaker\CircuitBreaker;
+use Gohany\Rtry\Impl\Breaker\CircuitTransition;
+use Gohany\Rtry\Impl\Breaker\InMemoryCircuitBreakerStore;
+use Gohany\Rtry\Impl\NativeClock;
+
+$clock = new NativeClock();
+$breaker = new CircuitBreaker(
+    new InMemoryCircuitBreakerStore($clock),
+    $clock,
+    failureThreshold: 5,
+    windowMs: 10_000,
+    openMs: 30_000,
+    onTransition: function (CircuitTransition $t) use ($logger): void {
+        $logger->warning('circuit.transition', [
+            'key' => $t->key,
+            'from' => $t->from->value, // closed, open, half_open
+            'to' => $t->to->value,
+            'at_ms' => $t->atUnixMs,
+        ]);
+    },
+);
+```
+
+The callback runs synchronously inside `allow()`, `recordSuccess()` or `recordFailure()`, so
+keep it cheap. Anything it throws is swallowed: a broken listener never fails the call it is
+watching.
+
+**Across processes.** The callback runs in the process whose compare-and-set made the change.
+Every process sharing a store reads the same versioned state and only one write from a given
+version succeeds, so each change is reported by one process, however many share the store. A
+shared `CircuitBreakerStoreInterface` keeps that guarantee if:
+
+- `compareAndSet()` is atomic: it writes only when the stored version equals the expected one
+  (`null` meaning absent), and every write changes the version.
+- It returns `true` only when its own write happened. When it cannot tell (a timeout after the
+  write was sent), it returns `false` and does not resend the write. The breaker then re-reads;
+  if the write had landed it finds the change already made and reports nothing. A change is
+  then reported at most once rather than exactly once, never twice.
+
+One limit: a key nobody touches for `windowMs + 2 × openMs` expires from the store and reads as
+closed again, with no transition reported. A count of open circuits built from the callback
+should treat a circuit it has heard nothing about for that long as closed.
+
 ## The `rtry:` string
 
 ```

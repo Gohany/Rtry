@@ -1,6 +1,23 @@
 # Changelog
 
-## 2.0.0 — unreleased
+## 2.1.0 — unreleased
+
+Additive: no change for 2.0 callers, and none to the gohany/retry interfaces.
+
+### Added
+
+- `CircuitBreaker` takes an optional `onTransition` callback, `callable(CircuitTransition): void`,
+  as its sixth constructor argument. It runs once per change of a circuit's state
+  (closed → open, open → half-open, half-open → closed or open), never per call, in the
+  process whose compare-and-set made the change, so a change is reported once however many
+  processes share the store. Anything it throws is swallowed.
+- `Breaker\CircuitTransition`: the key, `from` and `to` (`Gohany\Retry\CircuitState`), and
+  `atUnixMs` from the breaker's clock (`at()` as a `DateTimeImmutable`).
+- README: what a shared `CircuitBreakerStoreInterface` must do to keep transitions reported
+  once across processes, and the one gap (a key that expires while open reads as closed with
+  no transition).
+
+## 2.0.0 — 2026-11-17
 
 Rtry 2 implements gohany/retry 2.0 and fixes the 1.x backoff bugs. **Several behaviours
 change**; read "Behaviour changes" before upgrading.
