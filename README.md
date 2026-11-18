@@ -166,8 +166,27 @@ $results = $retry->try(fn ($attempt) => $client->get($url), (new RtryPolicyFacto
 ```
 
 When the breaker is open, `try()` throws `Gohany\Retry\CircuitOpenException` without calling
-the operation. A failure the policy does not retry, such as a 404, counts as a success for the
+the operation. When a failure leaves the circuit open (it was the one that opened it, a probe
+failed, or another worker opened it meanwhile), the run ends at once and `try()` rethrows that
+failure; it does not sleep toward a retry the breaker would refuse, and it spends no budget
+token. A failure the policy does not retry, such as a 404, counts as a success for the
 breaker: the service answered.
+
+### When a guard's store fails
+
+A shared store can fail (Valkey restarting, a network partition). A guard that throws never
+replaces the operation's own value or error:
+
+- **Breaker: fails open.** If `allow()` or `state()` throws, the attempt goes ahead as if the
+  circuit were closed. The policy's attempts, delays and deadline still bound the run.
+- **Budget: fails closed.** If `tryAcquire()` throws, there is no retry: the run gives up with
+  `BudgetExhausted` and the operation's last error. The first attempt is never blocked.
+- **Reports are best effort.** If `recordSuccess()` or `recordFailure()` throws, the error is
+  ignored and the operation's value or error comes back unchanged.
+
+Each is logged at `warning` as `retry.guard_error` with `guard`, `call`, `key` and
+`exception_class`, never the message (it can carry a host or a credential). So a store
+outage costs at most the policy's own retries per call, and never the result.
 
 The in-memory stores cap one process. To share a budget or breaker across workers, implement
 `RetryBudgetStoreInterface` (an atomic clamped add) and `CircuitBreakerStoreInterface` (a

@@ -1,6 +1,26 @@
 # Changelog
 
-## 2.1.0 — unreleased
+## Unreleased
+
+No interface changes; two behaviour fixes for callers using `withGuard()`.
+
+### Fixed
+
+- **No sleep after the circuit opens.** After a retryable failure, `Retry` now checks the
+  breaker's state before sleeping. If the circuit is anything but closed (this failure opened
+  it, a half-open probe failed, or another worker opened it), the run ends at once with
+  `CircuitOpen` and the operation's own last error, which `try()` rethrows. 2.0 and 2.1 slept
+  the next delay first and only then found the circuit open; no budget token is spent on that
+  refused retry any more either. A spec run `rtry:a=5;d=100;j=0;on=5xx` against a breaker
+  with threshold 2 now sleeps `[100]`, not `[100, 200]`.
+- **A failing guard never hides the outcome.** A breaker or budget that throws (its store is
+  down) no longer replaces the operation's value or error. The breaker fails open, the budget
+  fails closed (no retry, `BudgetExhausted`, with the operation's error), and a failed
+  `recordSuccess()`/`recordFailure()` is ignored. Each is logged at `warning` as
+  `retry.guard_error` with the exception's class, never its message. README, "When a guard's
+  store fails".
+
+## 2.1.0 — 2026-11-17
 
 Additive: no change for 2.0 callers, and none to the gohany/retry interfaces.
 
