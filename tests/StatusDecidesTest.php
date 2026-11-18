@@ -9,7 +9,7 @@ use Gohany\Retry\Testing\RecordingSleeper;
 use Gohany\Retry\Testing\SeededRandom;
 use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
 use Gohany\Rtry\Impl\ErrorResponse;
-use Gohany\Rtry\Impl\Psr7ErrorResponseReader;
+use Gohany\Rtry\Impl\ErrorResponseLocator;
 use Gohany\Rtry\Impl\Retry;
 use Gohany\Rtry\Impl\RtryPolicyFactory;
 use Gohany\Rtry\Impl\Rules\InstanceOfRule;
@@ -67,15 +67,16 @@ final class StatusDecidesTest extends TestCase
         self::assertSame([], $meta->getTags());
     }
 
-    public function testAnExceptionCodeIn400To599IsAStatusThatSilencesMessageTags(): void
+    public function testAnExceptionCodeIn400To599IsAStatusButDoesNotSilenceTransportTags(): void
     {
-        // Symfony HttpClient's exceptions carry the status as their code.
+        // A code alone is not proof of HTTP (SMTP 421, a deadlock coded 409): it still matches
+        // on=404, but only a status read from a response decides alone.
         $meta = RuleBasedFailureClassifier::default()->classify(
             new \RuntimeException('HTTP/2 404 returned for "https://api.example.test/connection refused/x".', 404)
         );
 
         self::assertSame(404, $meta->getStatusCode());
-        self::assertSame([], $meta->getTags());
+        self::assertSame(['ECONNREFUSED'], $meta->getTags());
     }
 
     public function testRateLimitHeadersOnAnOrdinary4xxDoNotTagRateLimited(): void
@@ -182,13 +183,15 @@ final class StatusDecidesTest extends TestCase
 
     // ---- the reader seam for clients that are not PSR-7 --------------------------------------
 
-    public function testWithoutAReaderASymfonyStyle503RetriesOnItsCodeButCannotSeeRetryAfter(): void
+    public function testWithoutAReaderASymfonyStyle503HonoursRetryAfter(): void
     {
+        // The default reads getResponse()->getStatusCode() and getHeaders(false) when the
+        // response is not PSR-7.
         $policy = (new RtryPolicyFactory())->fromSpec('rtry:a=3;d=100;j=0');
 
         $this->retry->try(self::failing(1, new SymfonyShapedFailure(503, ['retry-after' => ['2']])), $policy);
 
-        self::assertSame([100], $this->sleeper->sleeps());
+        self::assertSame([2000], $this->sleeper->sleeps());
     }
 
     public function testAReaderLetsASymfonyStyle503Or429HonourRetryAfter(): void
@@ -207,22 +210,21 @@ final class StatusDecidesTest extends TestCase
         $reader = new SymfonyShapedReader();
         $classifier = new RuleBasedFailureClassifier([new ResponseStatusRule($reader), new RateLimitBackoffRule($reader)]);
 
-        // Only the reader's rules: they find the 404 and see its rate-limit header.
-        $meta = $classifier->classify(new SymfonyShapedFailure(404, ['x-ratelimit-reset' => ['30']]));
+        // Only the reader's rules, and code 0: the 404 comes from the response, not the code.
+        $meta = $classifier->classify(new SymfonyShapedFailure(404, ['x-ratelimit-reset' => ['30']], null, 0, 'worker timed out'));
 
         self::assertSame(404, $meta->getStatusCode());
         self::assertSame([], $meta->getTags());
     }
 
-    public function testThePsr7ReaderReadsStatusAndLowerCasedHeaders(): void
+    public function testTheDefaultLocatorReadsStatusAndLowerCasedHeaders(): void
     {
-        $response = (new Psr7ErrorResponseReader())->read(HttpFailure::status(503, ['Retry-After' => '7']));
+        $response = (new ErrorResponseLocator())->read(HttpFailure::status(503, ['Retry-After' => '7']));
 
         self::assertNotNull($response);
         self::assertSame(503, $response->statusCode);
         self::assertSame(['retry-after' => ['7']], $response->headers);
-        self::assertNull((new Psr7ErrorResponseReader())->read(new \RuntimeException('no response')));
-        self::assertNull((new Psr7ErrorResponseReader())->read(new SymfonyShapedFailure(503)));
+        self::assertNull((new ErrorResponseLocator())->read(new \RuntimeException('no response')));
     }
 }
 

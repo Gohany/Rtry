@@ -7,6 +7,8 @@ use Gohany\Retry\Testing\RecordingSleeper;
 use Gohany\Retry\Testing\SeededRandom;
 use Gohany\Rtry\Impl\Breaker\CircuitBreaker;
 use Gohany\Rtry\Impl\Breaker\InMemoryCircuitBreakerStore;
+use Gohany\Rtry\Impl\Budget\InMemoryRetryBudgetStore;
+use Gohany\Rtry\Impl\Budget\TokenBucketRetryBudget;
 use Gohany\Rtry\Impl\Retry;
 use Gohany\Rtry\Impl\RtryPolicyFactory;
 use Gohany\Rtry\Tests\Support\HttpFailure;
@@ -117,5 +119,64 @@ final class GiveUpLoggingTest extends TestCase
             self::assertStringNotContainsString('example.test', json_encode($context, JSON_THROW_ON_ERROR), $message);
         }
         self::assertContains(HttpFailure::class, array_column(array_column($this->logs, 2), 'exception_class'));
+    }
+
+    /** @return list<array{string,string,array<string,mixed>}> records named $message */
+    private function records(string $message): array
+    {
+        return array_values(array_filter($this->logs, static fn (array $r): bool => $r[1] === $message));
+    }
+
+    public function testADeadlineGiveUpAndItsLastFailureAreWarnings(): void
+    {
+        $policy = (new RtryPolicyFactory())->fromSpec('rtry:a=10;d=100;j=0;dl=350');
+
+        $this->retry()->tryOutcome(self::throws(HttpFailure::status(503)), $policy);
+
+        $giveUps = $this->records('retry.give_up');
+        self::assertSame([['warning', 'deadline_exceeded']], array_map(static fn (array $r): array => [$r[0], $r[2]['reason']], $giveUps));
+        $failures = $this->records('retry.failure');
+        self::assertCount(3, $failures);
+        self::assertSame(['warning', 'warning', 'warning'], array_column($failures, 0));
+    }
+
+    public function testABudgetGiveUpIsAWarning(): void
+    {
+        $budget = new TokenBucketRetryBudget(new InMemoryRetryBudgetStore($this->clock), 4, 0.1);
+        $policy = (new RtryPolicyFactory())->fromSpec('rtry:a=10;d=100;j=0');
+
+        $this->retry()->withGuard('svc', $budget)->tryOutcome(self::throws(HttpFailure::status(503)), $policy);
+
+        $giveUps = $this->records('retry.give_up');
+        self::assertSame([['warning', 'budget_exhausted']], array_map(static fn (array $r): array => [$r[0], $r[2]['reason']], $giveUps));
+        self::assertNotContains('error', array_column($this->logs, 0));
+    }
+
+    public function testACircuitOpenBeforeAnyAttemptIsAWarning(): void
+    {
+        $breaker = new CircuitBreaker(new InMemoryCircuitBreakerStore($this->clock), $this->clock, failureThreshold: 1, windowMs: 10_000, openMs: 5_000);
+        $policy = (new RtryPolicyFactory())->fromSpec('rtry:a=3;d=100;j=0');
+        $retry = $this->retry()->withGuard('svc', null, $breaker);
+        $retry->tryOutcome(self::throws(HttpFailure::status(503)), $policy);
+        $this->logs = [];
+
+        $result = $retry->tryOutcome(self::throws(HttpFailure::status(503)), $policy);
+
+        self::assertSame(0, $result->attempts());
+        self::assertSame(['warning retry.give_up'], $this->lines());
+        self::assertSame('circuit_open', $this->logs[0][2]['reason']);
+    }
+
+    public function testAnAnonymousExceptionClassIsLoggedWithoutItsFilePath(): void
+    {
+        $policy = (new RtryPolicyFactory())->fromSpec('rtry:a=1;d=100;j=0');
+        $error = new class ('Connection refused') extends \RuntimeException {
+        };
+
+        $this->retry()->tryOutcome(self::throws($error), $policy);
+
+        self::assertSame('RuntimeException@anonymous', $this->records('retry.failure')[0][2]['exception_class']);
+        self::assertSame('RuntimeException@anonymous', $this->records('retry.give_up')[0][2]['last_error_class']);
+        self::assertStringNotContainsString(__FILE__, json_encode($this->logs, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE));
     }
 }
