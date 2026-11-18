@@ -2,9 +2,11 @@
 
 namespace Gohany\Rtry\Impl\Rules;
 
+use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
 use Gohany\Rtry\Contracts\RuleInterface;
 use Gohany\Rtry\Contracts\FailureMetadataInterface;
 use Gohany\Rtry\Impl\FailureMetadata;
+use Gohany\Rtry\Impl\Psr7ErrorResponseReader;
 
 /**
  * Extracts backoff hints from HTTP response headers:
@@ -12,29 +14,44 @@ use Gohany\Rtry\Impl\FailureMetadata;
  * - RateLimit-Reset / X-RateLimit-Reset: delta seconds below 10^9, otherwise epoch seconds or ms
  * - RateLimit-Reset-After / X-RateLimit-Reset-After: delta seconds
  *
- * Tags 'RATE_LIMITED' when a rate-limit header is observed.
+ * The response comes from an ErrorResponseReaderInterface: PSR-7 getResponse() by default.
+ *
+ * Tags 'RATE_LIMITED' when a rate-limit header is observed on a 429 or a 503, or on a response
+ * that is not an HTTP error. Many APIs send X-RateLimit-* on every response, so on any other
+ * 4xx or 5xx the header is only a delay hint and the status alone decides.
  */
 final class RateLimitBackoffRule implements RuleInterface
 {
+    private readonly ErrorResponseReaderInterface $reader;
+
+    public function __construct(?ErrorResponseReaderInterface $reader = null)
+    {
+        $this->reader = $reader ?? new Psr7ErrorResponseReader();
+    }
+
     /**
      * Extract backoff hints from common rate-limit headers.
      * Returns FailureMetadata with:
      *  - status (only if >= 400),
-     *  - tags ['RATE_LIMITED'],
+     *  - tags ['RATE_LIMITED'] on a 429, a 503 or a status below 400,
      *  - context patch (empty array here),
      *  - either minNextDelayMs OR notBeforeUnixMs,
      *  - echoed subset of headers that influenced the decision.
      */
     public function apply(\Throwable $e): ?FailureMetadataInterface
     {
-        // 1) Find a PSR-7 response on the exception.
-        $response = $this->extractResponse($e);
+        // 1) Find the response on the exception. A reader that throws found nothing.
+        try {
+            $response = $this->reader->read($e);
+        } catch (\Throwable) {
+            return null;
+        }
         if ($response === null) {
             return null;
         }
 
         // 2) Normalize headers to a simple lowercase map: name => firstValueString.
-        $headers = $this->normalizeHeaders($response->getHeaders());
+        $headers = $this->normalizeHeaders($response->headers);
         if ($headers === []) {
             return null;
         }
@@ -49,7 +66,7 @@ final class RateLimitBackoffRule implements RuleInterface
         $usedKeys = $hints['usedKeys'];
 
         // 4) Decide whether to propagate HTTP status. (Only if >= 400.)
-        $statusCode = $response->getStatusCode();
+        $statusCode = $response->statusCode;
         $statusOut = ($statusCode >= 400) ? $statusCode : null;
 
         // 5) Build a slim header echo containing only keys that influenced the outcome.
@@ -60,8 +77,8 @@ final class RateLimitBackoffRule implements RuleInterface
             }
         }
 
-        // 6) Tag and return metadata.
-        $tags = ['RATE_LIMITED'];
+        // 6) Tag and return metadata. Any other HTTP error status is judged by itself alone.
+        $tags = ($statusOut === null || $statusOut === 429 || $statusOut === 503) ? ['RATE_LIMITED'] : [];
         $ctxPatch = []; // keep empty unless you want to surface more context
 
         return new FailureMetadata(
@@ -75,25 +92,7 @@ final class RateLimitBackoffRule implements RuleInterface
     }
 
     /**
-     * Try to get a PSR-7 response from a throwable via getResponse().
-     */
-    private function extractResponse(\Throwable $e): ?\Psr\Http\Message\ResponseInterface
-    {
-        if (!method_exists($e, 'getResponse')) {
-            return null;
-        }
-        try {
-            /** @var mixed $resp */
-            $resp = $e->getResponse();
-
-            return ($resp instanceof \Psr\Http\Message\ResponseInterface) ? $resp : null;
-        } catch (\Throwable $_) {
-            return null;
-        }
-    }
-
-    /**
-     * Normalize PSR-7 headers to: lowercased-name => first string value.
+     * Normalize headers to: lowercased-name => first string value.
      * Examples:
      *   ['Retry-After' => ['1']]        -> ['retry-after' => '1']
      *   ['X-RateLimit-Reset' => [1234]] -> ['x-ratelimit-reset' => '1234']

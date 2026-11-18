@@ -77,11 +77,49 @@ Rtry turns a thrown error into a status and tags with a `RuleBasedFailureClassif
 - the status of a PSR-7 response returned by the error's `getResponse()` (Guzzle, and most
   PSR-18 clients' exceptions), or else an exception code between 100 and 599;
 - `Retry-After`, `RateLimit-Reset(-After)` and `X-RateLimit-Reset(-After|-Ms)` headers on that
-  response, tagged `RATE_LIMITED`;
+  response, which set the next delay and tag a 429 or a 503 `RATE_LIMITED`;
 - `ETIMEDOUT`, `ECONNRESET`, `ECONNREFUSED` and `NETWORK_ERROR` from the message and
   `Psr\Http\Client\NetworkExceptionInterface`;
 - `DEADLOCK` from deadlock and serialization failures (MySQL 1213/1205, SQLSTATE 40001/40P01,
   Doctrine's `DeadlockException`).
+
+An error carrying an HTTP error status (400 to 599) is judged by that status alone. A 404 whose
+URL contains "timeout" gets no `ETIMEDOUT`, and a 404 from an API that sends
+`X-RateLimit-Reset` on every response is not `RATE_LIMITED`: both run once. Errors without an
+HTTP status, transport errors among them (an errno code such as 111 is not one), keep the tags
+from their message and type. Tags from rules you add stay whatever the status.
+
+### Clients that are not PSR-7
+
+The status and `Retry-After` come from an `ErrorResponseReaderInterface`. The default reads a
+PSR-7 response from `getResponse()`. For another client, write a reader and pass it to
+`RuleBasedFailureClassifier::default()`. Symfony HttpClient, for example:
+
+```php
+use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
+use Gohany\Rtry\Impl\ErrorResponse;
+use Gohany\Rtry\Impl\RtryPolicyFactory;
+use Gohany\Rtry\Impl\RuleBasedFailureClassifier;
+use Symfony\Contracts\HttpClient\Exception\HttpExceptionInterface;
+
+final class SymfonyResponseReader implements ErrorResponseReaderInterface
+{
+    public function read(\Throwable $e): ?ErrorResponse
+    {
+        if (!$e instanceof HttpExceptionInterface) {
+            return null;
+        }
+        $response = $e->getResponse();
+        // false: Symfony's getHeaders() throws on a 4xx/5xx otherwise.
+        return new ErrorResponse($response->getStatusCode(), $response->getHeaders(false));
+    }
+}
+
+$factory = new RtryPolicyFactory(null, RuleBasedFailureClassifier::default(new SymfonyResponseReader()));
+```
+
+Without a reader, a Symfony error still retries on its status (its exception code), but its
+`Retry-After` goes unseen.
 
 Add your own rules, or pass a decider that replaces `on`:
 
@@ -292,6 +330,11 @@ $retry->setOnGiveUpHook(function ($attempt, $outcome, $policy, array $headers): 
 
 A PSR-3 logger gets the attempt number, the exception class, the status and the tags. It never
 gets the error message, which can carry request data.
+
+Nothing is logged at `error`: the caller gets the error back and decides how loud to be. A
+failure the policy does not retry (`retry.failure`) and its `retry.give_up` are `debug`. A
+retryable failure is `warning`, and so is a give-up because attempts, the deadline, the budget
+or the circuit ran out. `retry.attempt` is `debug`, `retry.success` `info`.
 
 ## Testing your code
 

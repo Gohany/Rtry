@@ -141,20 +141,22 @@ final class Retry implements RetryerInterface, RetryHooksInterface
                 }
                 $outcome = RtryAttemptOutcome::fromMetadata($error, $metadata, $this->nowMs());
 
-                // Never log the message: it can carry request data. Class, status and tags only.
-                $this->log('warning', 'retry.failure', [
-                    'attempt' => $attempt,
-                    'exception_class' => get_class($error),
-                    'status_code' => $outcome->statusCode(),
-                    'tags' => $outcome->tags(),
-                ]);
-
                 $decision = $this->scheduler->next(
                     $policy,
                     $outcome,
                     $this->context($attempt, $maxAttempts, $delay, $firstMs, $deadlineMs, $context),
                 );
                 $reason = $decision->giveUpReason();
+
+                // A failure the policy does not retry (a 404, a validation error) is the caller's
+                // business, not a retry event: debug. Never log the message: it can carry
+                // request data. Class, status and tags only.
+                $this->log($reason === GiveUpReason::NotRetryable ? 'debug' : 'warning', 'retry.failure', [
+                    'attempt' => $attempt,
+                    'exception_class' => get_class($error),
+                    'status_code' => $outcome->statusCode(),
+                    'tags' => $outcome->tags(),
+                ]);
 
                 $this->report('breaker', $reason === GiveUpReason::NotRetryable ? 'recordSuccess' : 'recordFailure');
 
@@ -265,9 +267,13 @@ final class Retry implements RetryerInterface, RetryHooksInterface
         ]);
     }
 
+    /**
+     * A give-up is never logged at error: the caller gets the error back and decides how loud
+     * to be. Not retryable is debug; out of attempts, deadline, budget or circuit is warning.
+     */
     private function giveUp(Throwable $error, int $attempts, GiveUpReason $reason): RetryResult
     {
-        $this->log('error', 'retry.give_up', [
+        $this->log($reason === GiveUpReason::NotRetryable ? 'debug' : 'warning', 'retry.give_up', [
             'attempts' => $attempts,
             'reason' => $reason->value,
             'last_error_class' => get_class($error),

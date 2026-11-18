@@ -2,12 +2,13 @@
 
 namespace Gohany\Rtry\Impl;
 
+use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
 use Gohany\Rtry\Contracts\FailureClassifierInterface;
 use Gohany\Rtry\Contracts\FailureMetadataInterface;
 use Gohany\Rtry\Contracts\RuleBasedClassifierInterface;
 use Gohany\Rtry\Contracts\RuleInterface;
-use Gohany\Rtry\Impl\Rules\MethodStatusRule;
 use Gohany\Rtry\Impl\Rules\RateLimitBackoffRule;
+use Gohany\Rtry\Impl\Rules\ResponseStatusRule;
 
 final class RuleBasedFailureClassifier implements FailureClassifierInterface, RuleBasedClassifierInterface
 {
@@ -24,12 +25,13 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
     }
 
     /**
-     * What every policy gets unless a classifier is injected: the status of a PSR-7 response
-     * on the error (getResponse()), and Retry-After / RateLimit-Reset from its headers.
+     * What every policy gets unless a classifier is injected: the status of the HTTP response
+     * on the error, and Retry-After / RateLimit-Reset from its headers. The response is a PSR-7
+     * one from getResponse() unless $reader finds it another way (Symfony HttpClient, say).
      */
-    public static function default(): self
+    public static function default(?ErrorResponseReaderInterface $reader = null): self
     {
-        return new self([new MethodStatusRule(['getResponse']), new RateLimitBackoffRule()]);
+        return new self([new ResponseStatusRule($reader), new RateLimitBackoffRule($reader)]);
     }
 
     public function classify(\Throwable $e): FailureMetadataInterface
@@ -73,13 +75,19 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
             }
         }
 
-        // Always include tags derived from the Throwable
-        $tags = array_values(array_unique(array_merge($tags, $this->collectTags($e))));
-
         // Fallbacks
         if ($status === null) {
             $status = $this->extractStatusCode($e);
         }
+
+        // An error carrying an HTTP error status is judged by that status alone: a 404 whose
+        // URL says "timeout" is still a 404. Only an error without one (a transport error; an
+        // errno such as 111 is not an HTTP status) gets tags from its message and type. Tags
+        // from the rules stay: a caller's own rule says what it means.
+        if ($status === null || $status < 400 || $status > 599) {
+            $tags = array_merge($tags, $this->collectTags($e));
+        }
+        $tags = array_values(array_unique($tags));
 
         return new FailureMetadata($status, $tags, $ctxPatch, $minNextDelayMs, $notBeforeUnixMs, $headers);
     }

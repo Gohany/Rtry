@@ -10,7 +10,10 @@ never parsed. It is superseded; see [CHANGELOG.md](CHANGELOG.md) for what change
 Rtry-specific behaviour the SPEC leaves to implementations:
 
 - **Classification.** A thrown error becomes a status code and tags through a
-  `RuleBasedFailureClassifier` (README, "What retries"). `RateLimit-Reset` values below 10^9
+  `RuleBasedFailureClassifier` (README, "What retries"). An error carrying an HTTP error status
+  (400-599) is judged by that status alone: its message adds no tags, and a rate-limit header
+  tags `RATE_LIMITED` only on a 429 or a 503. Errors without one (transport errors, including
+  errno codes such as 111) keep the tags from their message and type. `RateLimit-Reset` values below 10^9
   are delta seconds (the IETF RateLimit fields); larger values are an epoch time in seconds,
   or in milliseconds from 10^12.
 - **Breakers.** A failure the policy does not retry counts as a success for the circuit
@@ -24,4 +27,6 @@ Rtry-specific behaviour the SPEC leaves to implementations:
   `CircuitBreaker`'s optional `onTransition` callback (2.1) reports each change of state once,
   from the process whose compare-and-set made it; README, "Watching the breaker open and close".
 - **Hedging and per-attempt timeouts** are parsed and exposed; Rtry acts on neither.
-- **Logging.** The PSR-3 logger never receives an error's message.
+- **Logging.** The PSR-3 logger never receives an error's message. Nothing is logged at
+  `error`: a failure the policy does not retry, and its give-up, are `debug`; a retryable
+  failure and any other give-up are `warning`.

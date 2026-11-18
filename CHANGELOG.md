@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+Three behaviour changes and one additive seam; no change to the gohany/retry interfaces.
+
+### Changed
+
+- **An HTTP error status decides alone.** When an error carries a status from 400 to 599 (from
+  a rule, or its exception code), the classifier no longer adds tags from its message. A 404
+  whose URL contains "timeout" used to be tagged `ETIMEDOUT` and retried under `on=default`;
+  it now runs once. Errors without an HTTP status keep their tags, including errno-coded
+  transport errors such as `Connection refused` with code 111. Tags from your own rules are
+  unchanged. A spec that relied on a message tag to retry a 5xx (say `on=ETIMEDOUT` for a
+  504) now needs the status (`on=504` or `on=5xx`).
+- **`RATE_LIMITED` only on a 429 or a 503.** `RateLimitBackoffRule` still turns rate-limit
+  headers into a delay on any response, but tags `RATE_LIMITED` only on a 429, a 503 or a
+  response below 400. An API that sends `X-RateLimit-Reset` on every response no longer makes
+  its 404s and 422s retryable.
+- **No give-up is logged at `error`.** A failure the policy does not retry and its give-up are
+  logged at `debug` (`retry.failure` was `warning`, `retry.give_up` was `error`). Any other
+  give-up (attempts, deadline, budget, circuit) is logged at `warning`, not `error`. Still the
+  exception's class, never its message.
+
+### Added
+
+- `Contracts\ErrorResponseReaderInterface` and `ErrorResponse` (a status and lower-cased
+  headers): how the classifier finds the HTTP response on an error. `Psr7ErrorResponseReader`
+  is the default. Pass your own to `RuleBasedFailureClassifier::default($reader)` so a client
+  that is not PSR-7 (Symfony HttpClient) has its `Retry-After` honoured; README, "Clients that
+  are not PSR-7".
+- `Rules\ResponseStatusRule`: the status from a reader. `default()` uses it in place of
+  `MethodStatusRule(['getResponse'])`, with the same result for PSR-7 responses.
+  `RateLimitBackoffRule` takes an optional reader too.
+
+## 2.2.0 — 2026-11-18
+
 No interface changes; two behaviour fixes for callers using `withGuard()`.
 
 ### Fixed
