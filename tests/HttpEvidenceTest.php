@@ -330,7 +330,7 @@ final class ResponsePropertyReader implements ErrorResponseReaderInterface
         if (!$e instanceof ResponsePropertyFailure) {
             return null;
         }
-        return new ErrorResponse($e->response->status(), $e->response->headers());
+        return new ErrorResponse($e->httpReply->status(), $e->httpReply->headers());
     }
 }
 

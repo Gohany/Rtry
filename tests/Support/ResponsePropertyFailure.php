@@ -3,13 +3,13 @@
 namespace Gohany\Rtry\Tests\Support;
 
 /**
- * A client error that keeps its response in a public property and leaves the exception code
- * at 0, so nothing but a reader can see its status (Laravel's RequestException keeps
- * $response; its code is the status, this one's is not). Test-only.
+ * A client error that keeps its response in a public property the locator does not read
+ * ($httpReply, not Laravel's $response) and leaves the exception code at 0, so nothing but a
+ * reader can see its status. Laravel's own shape is LaravelShapedFailure. Test-only.
  */
 final class ResponsePropertyFailure extends \RuntimeException
 {
-    public function __construct(public readonly object $response, string $message)
+    public function __construct(public readonly object $httpReply, string $message)
     {
         parent::__construct($message, 0);
     }
