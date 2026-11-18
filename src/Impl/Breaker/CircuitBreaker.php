@@ -18,21 +18,30 @@ use Psr\Clock\ClockInterface;
  *
  * The whole state of a key is one small JSON value behind the store's versioned
  * compare-and-set, so a clustered store needs no multi-key script.
+ *
+ * Optional $onTransition, callable(CircuitTransition): void, runs once per actual change of
+ * state (closed->open, open->half_open, half_open->closed, half_open->open), never per call,
+ * in the process whose compare-and-set made the change. Anything it throws is swallowed.
  */
 final class CircuitBreaker implements CircuitBreakerInterface
 {
     private const MAX_CAS_TRIES = 50;
 
+    private readonly ?\Closure $onTransition;
+
+    /** @param (callable(CircuitTransition): void)|null $onTransition */
     public function __construct(
         private readonly CircuitBreakerStoreInterface $store,
         private readonly ClockInterface $clock,
         private readonly int $failureThreshold = 5,
         private readonly int $windowMs = 10_000,
         private readonly int $openMs = 30_000,
+        ?callable $onTransition = null,
     ) {
         if ($failureThreshold < 1 || $windowMs < 1 || $openMs < 1) {
             throw new \InvalidArgumentException('failureThreshold, windowMs and openMs must be at least 1');
         }
+        $this->onTransition = $onTransition === null ? null : \Closure::fromCallable($onTransition);
     }
 
     public function allow(string $key): bool
@@ -111,15 +120,33 @@ final class CircuitBreaker implements CircuitBreakerInterface
     {
         for ($try = 0; $try < self::MAX_CAS_TRIES; $try++) {
             [$version, $state] = $this->read($key);
-            $next = $change($state, Clock::nowMs($this->clock));
+            $now = Clock::nowMs($this->clock);
+            $next = $change($state, $now);
             if ($next === null) {
                 return;
             }
             $ttl = $this->windowMs + 2 * $this->openMs;
             if ($this->store->compareAndSet($key, $version, json_encode($next, JSON_THROW_ON_ERROR), $ttl)) {
+                // Only the writer whose compare-and-set succeeded reports, so a change is
+                // reported once however many processes share the store.
+                if ($next['s'] !== $state['s']) {
+                    $this->report($key, $state['s'], $next['s'], $now);
+                }
                 return;
             }
         }
         throw new \RuntimeException('Circuit breaker state for ' . $key . ' kept changing; gave up after ' . self::MAX_CAS_TRIES . ' tries');
+    }
+
+    private function report(string $key, string $from, string $to, int $atUnixMs): void
+    {
+        if ($this->onTransition === null) {
+            return;
+        }
+        try {
+            ($this->onTransition)(new CircuitTransition($key, CircuitState::from($from), CircuitState::from($to), $atUnixMs));
+        } catch (\Throwable) {
+            // A listener must never turn a breaker call into a failure.
+        }
     }
 }

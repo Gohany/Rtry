@@ -15,5 +15,7 @@ Rtry-specific behaviour the SPEC leaves to implementations:
   or in milliseconds from 10^12.
 - **Breakers.** A failure the policy does not retry counts as a success for the circuit
   breaker. `Retry` asks the breaker before each attempt and the budget before each retry.
+  `CircuitBreaker`'s optional `onTransition` callback (2.1) reports each change of state once,
+  from the process whose compare-and-set made it; README, "Watching the breaker open and close".
 - **Hedging and per-attempt timeouts** are parsed and exposed; Rtry acts on neither.
 - **Logging.** The PSR-3 logger never receives an error's message.
