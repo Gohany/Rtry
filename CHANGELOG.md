@@ -1,13 +1,29 @@
 # Changelog
 
-## 2.4.2 — Unreleased
+## 2.5.0 — 2026-11-19
 
-Fixes from the re-verification of PR #9 at 2.4.1 (two should-fixes and five nits), a breaker
-key out of an exception message, and a bound on the spread above a server's `Retry-After`. No
-public API removed. One retry change: the spread above a server's wait is smaller (under
-Changed). The other changes bring 2.4.0's behaviour back where 2.4.1 moved it unintentionally.
+Fixes from the re-verification of PR #9 at 2.4.1 (two should-fixes and five nits) and from the
+hostile review of PR #10 (a tag blocker, a should-fix and five nits), breaker keys out of
+exception messages, and a bound on the spread above a server's `Retry-After`. A minor release:
+public API is added (`CircuitStateContendedException`, two optional arguments on
+`RtryScheduler::headerSpreadMs()`, `RtryAttemptOutcome::roomAboveServerTimeMs()`, two
+constants), none removed, and the spread above a server's wait changes the sleeps of every
+policy whose jitter window is over the bound (under Changed). Requires gohany/retry 2.0.1. The
+other changes bring 2.4.0's behaviour back where 2.4.1 moved it unintentionally.
 
 ### Fixed
+
+- **An open circuit refuses without the key in the message.** `Retry::try()` on an open
+  circuit throws gohany/retry's `CircuitOpenException`, and on gohany/retry 2.0.0 its message
+  was `Circuit open for <key>`: keys can carry tenant ids, and a key's words (`db.replica
+  connection refused pool`) were read as an outage by an outer guard. gohany/retry 2.0.1's
+  message is `Circuit open` with the key in `key()`; composer.json now requires `^2.0.1`, so
+  updating Rtry alone cannot leave 2.0.0 in place.
+- **A `PDOException` built from a driver's error is read as the driver's error.** `new
+  PDOException($mysqli->error, $mysqli->errno)` has no `errorInfo` and no PDO prefix, so its
+  number had no text: MySQL's 4031 idle disconnect was taken for an answer and did not count.
+  When a `PDOException` has an int code and neither, its whole message is the server's text,
+  as a `mysqli_sql_exception`'s is (so a lock wait timeout built this way is also read as one).
 
 - **MariaDB's 4031 no longer opens the circuit.** 2.4.1 counted 4031 by number alone as
   MySQL's idle disconnect. On MariaDB 4031 is a DDL answer (`Referenced trigger '...' for the
@@ -52,14 +68,28 @@ Changed). The other changes bring 2.4.0's behaviour back where 2.4.1 moved it un
   `RtryScheduler::headerSpreadMs()` takes the server's wait as a new optional fourth argument
   (without it, the 2.4.1 spread); `Retry`, `RtryScheduler::outcome()` and
   `RtryAttemptOutcome::fromError()` pass it. `RtryScheduler::HEADER_SPREAD_MIN_MS` and
-  `HEADER_SPREAD_PERCENT` name the bound; no spec key changes.
+  `HEADER_SPREAD_PERCENT` name the bound; no spec key changes. The cost is a denser herd
+  within that bound (README, "Retry-After and deadlines").
+- **Near `dl` the spread is scaled into the room left, not clipped onto `dl` - 1 ms.** Since
+  2.3 a server time within the spread of `dl` put every caller whose draw was wider on the
+  last millisecond before it: of 10,000 callers told `Retry-After: 29` under
+  `rtry:a=2;d=10s;dl=30s`, 6,610 sent attempt 2 at 29,999 ms (9,018 on 2.4.1), and under a
+  `seq=5s,20s;dl=30s` policy with 2.5 s attempts and `Retry-After: 12`, 3,095 of the 5,253
+  that reached attempt 3. The room before `dl` (and before the scheduler's ceiling) is now
+  part of the bound, so the draw is scaled into it: the busiest millisecond holds 22 and 38.
+  Whether a wait fits `dl` is still decided by the server's time, so no caller gains or loses
+  an attempt, and a room at least as wide as the bound changes nothing, draw for draw.
+  `headerSpreadMs()` takes the room as a fifth optional argument and
+  `RtryAttemptOutcome::roomAboveServerTimeMs()` computes it; `Retry`, `outcome()` and
+  `fromError()` pass it.
 
 ### Docs
 
 - README, "Database errors": 4031 by number and text; 1927 and 1735; the 24-character quote
   minimum; a wrapper quoting only part of an answer (`substr()`, `htmlspecialchars()`) is read;
   "proxies other than ProxySQL" widened to proxies and MySQL-compatible databases.
-- README, "Retry-After and deadlines", and SPEC.md: the bound on the spread.
+- README, "Retry-After and deadlines", and SPEC.md: the bound on the spread, what it costs the
+  herd, and the room before `dl` and the ceiling.
 
 ### Tests
 
@@ -69,12 +99,18 @@ Changed). The other changes bring 2.4.0's behaviour back where 2.4.1 moved it un
 - `HeaderSpreadBoundTest`: the bound per jitter mode and for a policy other than Rtry's, and
   end to end from a spec to the recorded sleeps (`Retry-After: 20` twice under `d=10s;dl=60s`
   sleeps 20 to 22 s each time, spread, and leaves the third attempt 8 s of `dl`).
-- `BreakerKeyNotInMessageTest`.
+- `BreakerKeyNotInMessageTest`, including the open circuit's refusal (red on gohany/retry 2.0.0).
+- `HeaderSpreadBoundTest`: the review's herd table at `dl` (10,000 callers per row, busiest
+  millisecond), the durable path and the scheduler's ceiling scaled into the room, and both
+  directions of `jitterWindowMs()`'s full/pm branch.
+- `MinorReleaseReviewFindingsTest`: a `PDOException` built from a driver's error, and the
+  review's unpinned edges (4031's whole text, PDO's `[4031]` form inside a message, the
+  24-character quote minimum, the Oracle check on MySQL's text tags).
 - `RealMariaDbTest` (group `mariadb`, `RTRY_MARIADB_HOST`): a real 4031 from MariaDB 11.4
   through PDO (emulated and native) and mysqli runs once and leaves the circuit closed; a
   killed connection and the idle disconnect still count.
 
-## 2.4.1 — Unreleased
+## 2.4.1 — 2026-11-19
 
 Fixes to the breaker verdict's matching from the re-verification of PR #7, the hostile
 review of PR #8 and the re-verification of PR #9. No public API changes. Two retry changes: a

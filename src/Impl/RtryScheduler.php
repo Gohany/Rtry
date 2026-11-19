@@ -66,8 +66,10 @@ final class RtryScheduler implements RetrySchedulerInterface
      * Classifies an error the attempt numbered $context->attemptNumber() threw into the outcome
      * to pass to next(), for a durable retry. The one place a durable caller sets the ceiling,
      * the clock and the randomness: this scheduler's. A server's Retry-After is spread above,
-     * never below, by the policy's jitter window for the next attempt, never past the context's
-     * remainingBudgetMs() (dl) or this scheduler's ceiling when the server's own wait fits them.
+     * never below, by the policy's jitter for the next attempt scaled into at most the larger
+     * of 1 s and 10 % of the server's wait (headerSpreadMs()), and into the room left before
+     * the context's remainingBudgetMs() (dl) or this scheduler's ceiling when the server's own
+     * wait fits them.
      *
      * $classifier defaults to the policy's (RtryPolicy::failureClassifier()), else Rtry's default.
      */
@@ -102,8 +104,15 @@ final class RtryScheduler implements RetrySchedulerInterface
      * d=10s) pushes the next attempt toward dl for nothing. A wider window is scaled down to
      * the bound, not clipped at it, so the spread stays spread. Retry, outcome() and
      * RtryAttemptOutcome::fromError() pass the wait; without it the spread is 2.4.1's.
+     *
+     * Given the room above the server's time ($roomMs: to dl - 1 ms, or to the scheduler's
+     * ceiling; RtryAttemptOutcome::roomAboveServerTimeMs()), the bound is at most that room, so
+     * a server time close to dl scales the draw into what is left instead of clipping every
+     * caller whose draw is wider onto dl - 1 ms. Zero or less leaves no room: no spread. A
+     * room at least as wide as the bound changes nothing, draw for draw. The same number of
+     * random draws either way.
      */
-    public static function headerSpreadMs(RetryPolicyInterface $policy, int $failedAttempt, Randomizer $random, ?int $serverWaitMs = null): int
+    public static function headerSpreadMs(RetryPolicyInterface $policy, int $failedAttempt, Randomizer $random, ?int $serverWaitMs = null, ?int $roomMs = null): int
     {
         if ($failedAttempt >= $policy->attempts()) {
             return 0;
@@ -116,10 +125,19 @@ final class RtryScheduler implements RetrySchedulerInterface
         $backoff = max(0, $backoff);
         $jitter = $policy->jitter();
         $spread = abs($jitter->apply($backoff, $random) - $backoff);
-        if ($serverWaitMs === null) {
+        $bound = null;
+        if ($serverWaitMs !== null) {
+            $bound = max(self::HEADER_SPREAD_MIN_MS, intdiv(max(0, $serverWaitMs), 100) * self::HEADER_SPREAD_PERCENT);
+        }
+        if ($roomMs !== null) {
+            $bound = min($bound ?? PHP_INT_MAX, max(0, $roomMs));
+        }
+        if ($bound === null) {
             return $spread;
         }
-        $bound = max(self::HEADER_SPREAD_MIN_MS, intdiv(max(0, $serverWaitMs), 100) * self::HEADER_SPREAD_PERCENT);
+        if ($bound === 0) {
+            return 0;
+        }
         $window = self::jitterWindowMs($jitter, $backoff);
         if ($window <= $bound) {
             // Within the bound already (or a jitter wider than its declared window: clip it).

@@ -281,10 +281,16 @@ above `cap` (gohany/retry SPEC 5.11). `fh=0` ignores the headers.
   waits exactly what the server said. The spread is at most the larger of 1 s and 10 % of the
   server's wait (`RtryScheduler::HEADER_SPREAD_MIN_MS`, `HEADER_SPREAD_PERCENT`); a wider
   window is scaled down to that, so after attempt 2 of `d=10s` a `Retry-After: 20` waits
-  between 20 and 22 s, not up to 40 s. The policy's own delay still applies when it is
-  longer (SPEC 5.11 takes the larger of the two). When the server's wait fits inside `dl`, the spread
-  never pushes it past `dl` (on the durable path, build the outcome with the scheduler's
-  `outcome()` and the attempt's context; see below).
+  between 20 and 22 s, not up to 40 s. The cost is a denser herd: callers told the same time
+  come back within that second rather than over the policy's whole window (of 10,000 callers
+  told `Retry-After: 5` after attempt 1 of `d=10s`, the busiest second holds about 6,000
+  instead of about 1,400), though no single millisecond holds more than a few dozen. The
+  policy's own delay still applies when it is longer (SPEC 5.11 takes the larger of the two).
+  When the server's wait fits inside `dl`, the spread never pushes it past `dl`: the room left
+  before `dl` is part of the bound, so a server time 300 ms before `dl` spreads callers over
+  those 300 ms instead of putting every caller whose draw was wider on its last millisecond
+  (on the durable path, build the outcome with the scheduler's `outcome()` and the attempt's
+  context; see below). The scheduler's ceiling is treated the same way.
 - **Bounded.** A wait past `dl` gives up with `DeadlineExceeded` without sleeping. So does a
   wait longer than a day (`RtryScheduler::MAX_HEADER_WAIT_MS`; pass another ceiling to
   `RtryScheduler`'s constructor for durable retries that should wait longer, and build their
