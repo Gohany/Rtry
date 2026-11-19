@@ -81,10 +81,17 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
             return $outcome;
         }
         $remaining = $context?->remainingBudgetMs();
+        $deadline = $remaining === null ? null : $now + HeaderWaits::clampDelta($remaining);
         return $outcome->spreadAboveServerTime(
             $now,
-            RtryScheduler::headerSpreadMs($policy, $failedAttempt, $random ?? new Randomizer(), $outcome->notBeforeUnixMs - $now),
-            $remaining === null ? null : $now + HeaderWaits::clampDelta($remaining),
+            RtryScheduler::headerSpreadMs(
+                $policy,
+                $failedAttempt,
+                $random ?? new Randomizer(),
+                $outcome->notBeforeUnixMs - $now,
+                $outcome->roomAboveServerTimeMs($now, $deadline, $maxHeaderWaitMs),
+            ),
+            $deadline,
             $maxHeaderWaitMs,
         );
     }
@@ -127,18 +134,38 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
         if ($this->success || $notBefore === null || $notBefore <= $nowUnixMs || $spreadMs <= 0) {
             return $this;
         }
-        $spread = min($spreadMs, HeaderWaits::MAX_EPOCH_MS - $notBefore);
-        if ($deadlineUnixMs !== null && $notBefore < $deadlineUnixMs) {
-            $spread = min($spread, $deadlineUnixMs - 1 - $notBefore);
-        }
-        if ($maxWaitMs !== null) {
-            // Over the ceiling already: this goes negative and the scheduler gives up anyway.
-            $spread = min($spread, $nowUnixMs + HeaderWaits::clampDelta($maxWaitMs) - $notBefore);
-        }
+        // Callers scale the draw into this room first (RtryScheduler::headerSpreadMs()), so the
+        // cut only guards a draw from elsewhere.
+        $spread = min($spreadMs, $this->roomAboveServerTimeMs($nowUnixMs, $deadlineUnixMs, $maxWaitMs));
         if ($spread <= 0) {
             return $this;
         }
         return new self(false, null, $this->error, $this->statusCode, $this->tags, $notBefore + $spread, $this->statusFromResponse);
+    }
+
+    /**
+     * How far the spread may move this failure's server time: up to the epoch ceiling, to
+     * $deadlineUnixMs - 1 when the server's own time is before it, and to $nowUnixMs +
+     * $maxWaitMs (zero or below when the server's own wait is over it; the scheduler gives up
+     * on that anyway). Null when this failure has no server time ahead of $nowUnixMs.
+     *
+     * @internal Retry and fromError() pass it to RtryScheduler::headerSpreadMs(), which scales
+     *           its draw into it, so callers told a time close to dl do not all land on dl - 1 ms.
+     */
+    public function roomAboveServerTimeMs(int $nowUnixMs, ?int $deadlineUnixMs = null, ?int $maxWaitMs = null): ?int
+    {
+        $notBefore = $this->notBeforeUnixMs;
+        if ($this->success || $notBefore === null || $notBefore <= $nowUnixMs) {
+            return null;
+        }
+        $room = HeaderWaits::MAX_EPOCH_MS - $notBefore;
+        if ($deadlineUnixMs !== null && $notBefore < $deadlineUnixMs) {
+            $room = min($room, $deadlineUnixMs - 1 - $notBefore);
+        }
+        if ($maxWaitMs !== null) {
+            $room = min($room, $nowUnixMs + HeaderWaits::clampDelta($maxWaitMs) - $notBefore);
+        }
+        return $room;
     }
 
     public function isSuccess(): bool

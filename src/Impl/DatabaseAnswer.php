@@ -334,7 +334,8 @@ final class DatabaseAnswer
     /**
      * What $t carries as a database error, or null when nothing. States are upper-cased; texts
      * are the driver's own messages, lower-cased: errorInfo[2] or a mysqli_sql_exception's
-     * message, then what follows PDO's prefix in the message.
+     * message, then what follows PDO's prefix in the message (or, for a PDOException with an
+     * int code and neither, its whole message).
      *
      * @return array{states: list<string>, number: ?int, texts: list<string>, oracle: bool}|null
      */
@@ -389,6 +390,11 @@ final class DatabaseAnswer
                 $number ??= (int) $n;
             }
             $texts[] = $m[5] ?? '';
+        } elseif ($t instanceof \PDOException && $texts === [] && is_int($t->getCode()) && $t->getCode() !== 0) {
+            // Built from a driver's error, new PDOException($mysqli->error, $mysqli->errno): no
+            // prefix and no errorInfo text, so the message is the server's text, as a
+            // mysqli_sql_exception's is.
+            $texts[] = $t->getMessage();
         }
         if ($states === [] && $number === null) {
             return null;
