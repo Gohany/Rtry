@@ -14,7 +14,9 @@ use Gohany\Rtry\Impl\Breaker\UnavailableEvidence;
  * - its error number: a PDOException's errorInfo[1] or int code, a mysqli_sql_exception's code,
  *   or the number PDO writes after that SQLSTATE ("General error: 1366", "[1049]");
  * - the driver's own text: errorInfo[2], a mysqli_sql_exception's message, and what follows
- *   PDO's prefix. Only their start is compared, which the server writes, never a value.
+ *   PDO's prefix; for a PDOException with a non-zero int code and neither errorInfo[2] nor the
+ *   prefix (built from a driver's error: new PDOException($mysqli->error, $mysqli->errno)),
+ *   its whole message. Only their start is compared, which the server writes, never a value.
  *
  * The message of a LogicException or an \Error (a bug or a validation error) is never read, so
  * "SQLSTATE[08006] is not a valid coupon code" is nothing here; its fields still are.
@@ -30,7 +32,8 @@ use Gohany\Rtry\Impl\Breaker\UnavailableEvidence;
  *   errors under HY000 (1366 "Incorrect integer value: '...'", 1525, 1411, 1298, and the
  *   connect errors 1049 "Unknown database '...'" and 1045), so the class cannot tell. Not
  *   Oracle's ORA numbers, which PDO_OCI files under HY000 too (its text, or the description
- *   PDO writes before it, starts with the OCI call). Client errors (2000 to 2999), proxies'
+ *   PDO writes before it, starts with the OCI call's name: "OCIStmtExecute: ORA-..."; not a
+ *   message that merely starts with "oci"). Client errors (2000 to 2999), proxies'
  *   numbers outside the range (ProxySQL's 9001 "Max connect timeout reached") and other
  *   databases' numbers fall outside and are read as before.
  *
@@ -109,6 +112,9 @@ final class DatabaseAnswer
      * bracketed number, text.
      */
     private const PDO_PREFIX = '~^SQLSTATE\[([0-9A-Za-z]{5})\](?:: ([^:\n]*)(?:: (\d+))?| \[(\d+)\])? ?(.*)~s';
+
+    /** PDO_OCI's description or text: the OCI call's name, then a colon or nothing. */
+    private const OCI_CALL = '~^\s*OCI[A-Za-z_]*(?::|$)~';
 
     /** PostgreSQL's lock_timeout (55P03), as the server's text starts. */
     private const PG_LOCK_TIMEOUT = '~^(?:error:\s+)?canceling statement due to lock timeout~';
@@ -384,7 +390,7 @@ final class DatabaseAnswer
         $readMessage = !($t instanceof \LogicException || $t instanceof \Error);
         if ($readMessage && preg_match(self::PDO_PREFIX, $t->getMessage(), $m)) {
             $states[] = $m[1];
-            $description = strtolower(ltrim($m[2] ?? ''));
+            $description = $m[2] ?? '';
             $n = ($m[3] ?? '') !== '' ? $m[3] : ($m[4] ?? '');
             if ($n !== '') {
                 $number ??= (int) $n;
@@ -399,11 +405,14 @@ final class DatabaseAnswer
         if ($states === [] && $number === null) {
             return null;
         }
-        $texts = array_map(static fn (string $text): string => strtolower(ltrim($text)), $texts);
-        $oracle = str_starts_with($description, 'oci');
+        // PDO_OCI writes the OCI call before Oracle's text ("OCIStmtExecute: ORA-01205: ..."),
+        // in its description or its text. A message that merely starts with "oci" ("Ocient
+        // loader: ...") is not Oracle's.
+        $oracle = (bool) preg_match(self::OCI_CALL, $description);
         foreach ($texts as $text) {
-            $oracle = $oracle || str_starts_with($text, 'oci');
+            $oracle = $oracle || preg_match(self::OCI_CALL, $text);
         }
+        $texts = array_map(static fn (string $text): string => strtolower(ltrim($text)), $texts);
         return [
             'states' => array_values(array_unique(array_map('strtoupper', $states))),
             'number' => $number,
