@@ -23,6 +23,8 @@ use Gohany\Rtry\Impl\RtryPolicyFactory;
 use Gohany\Rtry\Impl\RuleBasedFailureClassifier;
 use Gohany\Rtry\Impl\Rules\InstanceOfRule;
 use Gohany\Rtry\Impl\Rules\MethodStatusRule;
+use Gohany\Rtry\Tests\Support\DbalShaped;
+use Gohany\Rtry\Tests\Support\DbErrors;
 use Gohany\Rtry\Tests\Support\HttpFailure;
 use Gohany\Rtry\Tests\Support\RecordingBreaker;
 use Gohany\Rtry\Tests\Support\SymfonyShapedFailure;
@@ -184,14 +186,15 @@ final class ReVerifyFindingsTest extends TestCase
         yield 'ORA-20060 by message alone' => [new \RuntimeException($oracle)];
         $duplicate = "SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry 'broken pipe' for key 'products.name'";
         yield 'duplicate entry echoing an outage phrase' => [self::pdo($duplicate, 0, ['23000', 1062, "Duplicate entry 'broken pipe' for key 'products.name'"])];
-        yield 'the same, wrapped as DBAL does' => [new \RuntimeException('An exception occurred while executing a query: ' . $duplicate, 0, self::pdo($duplicate, 0, ['23000', 1062, 'dup']))];
+        yield 'the same, wrapped as DBAL does' => [new DbalShaped('An exception occurred while executing a query: ' . $duplicate, 1062, '23000', self::pdo($duplicate, 0, ['23000', 1062, 'dup']))];
+        yield 'the same, wrapped without a SQLSTATE of its own' => [new \RuntimeException('Saving failed: ' . $duplicate, 0, self::pdo($duplicate, 0, ['23000', 1062, 'dup']))];
         yield 'the same, by message alone' => [new \RuntimeException($duplicate)];
         yield 'duplicate entry echoing a timeout' => [new \RuntimeException("SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry 'timed out' for key 'products.name'")];
         yield 'duplicate entry echoing a refused connection' => [new \RuntimeException("SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry 'connection refused' for key 'products.name'")];
         yield 'duplicate entry echoing an errno and a cURL number' => [new \RuntimeException("SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry 'ECONNRESET cURL error 7' for key 'u'")];
         yield 'data too long, by its SQLSTATE in errorInfo' => [self::pdo("Data too long for column 'name': connection reset", 0, ['22001', 1406, 'x'])];
         yield 'a syntax error echoing SQL' => [new \RuntimeException("SQLSTATE[42000]: Syntax error or access violation: 1064 near 'server has gone away' at line 1")];
-        yield 'an injected SQLSTATE before the real one (DBAL 2 prints params first)' => [new \RuntimeException("An exception occurred while executing 'INSERT INTO t VALUES (?)' with params [\"SQLSTATE[08006] broken pipe\"]: SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry")];
+        yield 'an injected SQLSTATE before the real one (DBAL 2 prints params first)' => [new DbalShaped("An exception occurred while executing 'INSERT INTO t VALUES (?)' with params [\"SQLSTATE[08006] broken pipe\"]: SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry", 1062, '23000')];
         yield 'a trigger raising its own message' => [new \RuntimeException('SQLSTATE[45000]: <<Unknown error>>: 1644 connection refused by policy')];
         yield 'PostgreSQL RAISE EXCEPTION' => [new \RuntimeException('SQLSTATE[P0001]: Raise exception: 7 ERROR:  broken pipe in shipment 12')];
         yield 'a cardinality violation' => [new \RuntimeException('SQLSTATE[21000]: Cardinality violation: 1242 Subquery returns more than 1 row near connection refused')];
@@ -240,16 +243,24 @@ final class ReVerifyFindingsTest extends TestCase
         $policy = (new RtryPolicyFactory())->fromSpec($spec);
         $retry = $this->retry()->withGuard('db', null, $breaker, new ServiceFailureVerdict());
         foreach (['broken pipe', 'timed out', 'connection refused'] as $value) {
-            $message = "SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry '$value' for key 'products.name'";
-            $error = self::pdo($message, 0, ['23000', 1062, $message]);
-            $result = $retry->tryOutcome(static function () use (&$calls, $error): never {
-                $calls++;
-                throw $error;
-            }, $policy);
-            self::assertSame([1, GiveUpReason::NotRetryable], [$result->attempts(), $result->giveUpReason()], $value);
+            // A unique field (class 23), and fields MySQL files under HY000: a quantity, a date
+            // filter, a time zone, a tenant's database name (TagReviewFindingsTest has them all).
+            foreach ([
+                DbErrors::pdo('23000', 1062, "Duplicate entry '$value' for key 'products.name'"),
+                DbErrors::pdo('HY000', 1366, "Incorrect integer value: '$value' for column 'qty' at row 1"),
+                DbErrors::pdo('HY000', 1525, "Incorrect DATE value: '$value'"),
+                DbErrors::pdo('HY000', 1298, "Unknown or incorrect time zone: '$value'"),
+                DbErrors::pdoConnect('HY000', 1049, "Unknown database 'tenant_$value'"),
+            ] as $error) {
+                $result = $retry->tryOutcome(static function () use (&$calls, $error): never {
+                    $calls++;
+                    throw $error;
+                }, $policy);
+                self::assertSame([1, GiveUpReason::NotRetryable], [$result->attempts(), $result->giveUpReason()], $error->getMessage());
+            }
         }
 
-        self::assertSame(3, $calls, 'no call is refused');
+        self::assertSame(15, $calls, 'no call is refused');
         self::assertSame([], $this->sleeper->sleeps(), 'and none is retried');
         self::assertSame(CircuitState::Closed, $breaker->state('db'));
     }
@@ -276,6 +287,12 @@ final class ReVerifyFindingsTest extends TestCase
         };
         self::assertTrue(UnavailableEvidence::in($nothing));
         self::assertTrue(UnavailableEvidence::in($throws));
+        // Only the answering classes are answers: class 20, 24 to 29, 28 (access), 40 other
+        // than 40001/40P01, and HY000 without a MySQL server number are read (every class:
+        // TagReviewFindingsTest::testAnErrorInAnotherSqlstateClassIsStillRead).
+        foreach (['20000', '24000', '25006', '26000', '27000', '28000', '29000', '40002', '40003', 'HY000'] as $state) {
+            self::assertTrue(UnavailableEvidence::in(self::pdo('connection refused', 0, [$state, 0, 'x'])), $state);
+        }
         self::assertContains('ECONNREFUSED', RuleBasedFailureClassifier::default()->classify($nothing)->getTags());
         self::assertContains('DEADLOCK', RuleBasedFailureClassifier::default()->classify($timeout)->getTags());
     }
@@ -297,9 +314,13 @@ final class ReVerifyFindingsTest extends TestCase
 
     public function testAConnectionErrorThatEchoesAValueStillCounts(): void
     {
-        // The SQLSTATE says connection, so the words do not matter either way.
-        self::assertTrue(UnavailableEvidence::in(self::pdo("SQLSTATE[08006] [7] could not connect: 'Duplicate entry'", 0, ['08006', 7, 'x'])));
-        self::assertTrue(UnavailableEvidence::in(new \RuntimeException('SQLSTATE[HY000]: General error: 7 server closed the connection unexpectedly')));
+        // The connection error comes first; the echoed name carries an answering SQLSTATE and
+        // MySQL's words for a duplicate, and neither switches the outage off.
+        $echo = 'SQLSTATE[08006] [7] connection to server at "db" (10.0.0.5), port 5432 failed: FATAL:  database "SQLSTATE[23000] Duplicate entry" does not exist';
+        self::assertTrue(UnavailableEvidence::in(self::pdo($echo, 7, ['08006', 7, 'x'])), 'by errorInfo');
+        self::assertTrue(UnavailableEvidence::in(new \RuntimeException($echo)), 'by message alone');
+        self::assertTrue(UnavailableEvidence::in(new \RuntimeException("SQLSTATE[HY000] [2002] Connection refused (tenant 'SQLSTATE[23000]')")), 'a MySQL connect error');
+        self::assertTrue(UnavailableEvidence::in(new \RuntimeException("SQLSTATE[HY000]: General error: 7 server closed the connection unexpectedly near 'SQLSTATE[23000]'")), 'by its words');
     }
 
     // ---- C: a lock wait timeout is the database answering, like a deadlock -----------------
@@ -350,12 +371,16 @@ final class ReVerifyFindingsTest extends TestCase
 
     public function testATimeoutCountsUnlessItComesWithADeadlock(): void
     {
-        // ETIMEDOUT is ignored only beside DEADLOCK; alone, or with a refused connection, it counts.
+        // ETIMEDOUT is ignored only beside DEADLOCK on a lock timeout; alone, or with a refused
+        // connection, it counts.
         $verdict = new ServiceFailureVerdict(countRetryable: false);
         self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['ETIMEDOUT']), false));
         self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['deadlock', 'ECONNREFUSED']), false));
-        self::assertFalse($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['deadlock', 'etimedout']), false));
-        self::assertTrue((new ServiceFailureVerdict(['DEADLOCK']))->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['DEADLOCK', 'ETIMEDOUT']), false), 'unless you count DEADLOCK');
+        $lockTimeout = self::pdo('SQLSTATE[HY000]: General error: 1205 Lock wait timeout exceeded; try restarting transaction', 0, ['HY000', 1205, 'Lock wait timeout exceeded; try restarting transaction']);
+        self::assertFalse($verdict->isServiceFailure(RtryAttemptOutcome::failure($lockTimeout, null, ['deadlock', 'etimedout']), false));
+        // Beside an error that is no lock timeout, DEADLOCK drops nothing (TagReviewFindingsTest).
+        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['deadlock', 'etimedout']), false));
+        self::assertTrue((new ServiceFailureVerdict(['DEADLOCK']))->isServiceFailure(RtryAttemptOutcome::failure($lockTimeout, null, ['DEADLOCK', 'ETIMEDOUT']), false), 'unless you count DEADLOCK');
     }
 
     // ---- E: edges that survived mutation ---------------------------------------------------
