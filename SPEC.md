@@ -23,14 +23,20 @@ Rtry-specific behaviour the SPEC leaves to implementations:
   `RateLimit-Reset` values below 10^9 are delta seconds (the IETF RateLimit fields); larger
   values are an epoch time in seconds, or in milliseconds from 10^12.
 - **Server waits.** `RtryScheduler::next()` follows SPEC 5.11 step 5, and also gives up with
-  `DeadlineExceeded` when the server's wait exceeds its ceiling (a day by default). `Retry`, and
-  `RtryAttemptOutcome::fromError()` when given the policy, move the outcome's `notBeforeUnixMs`
+  `DeadlineExceeded` when the server's wait exceeds its ceiling (a day by default). `Retry`,
+  `RtryScheduler::outcome()`, and `RtryAttemptOutcome::fromError()` when given the policy, move the outcome's `notBeforeUnixMs`
   later by the policy's jitter window for that attempt, so a Retry-After is jittered above and
   never below. Whether a wait fits `dl` or the ceiling is decided by the server's time, not by
-  the spread: when it fits, the spread never pushes it past either. `fromError()` knows `dl`
-  only when given the attempt's context.
-- **Breakers.** A failure the policy does not retry counts as a success for the circuit
-  breaker. `Retry` asks the breaker before each attempt and the budget before each retry.
+  the spread: when it fits, the spread never pushes it past either. `outcome()` takes `dl` from
+  the context it is given and the ceiling from its scheduler. `fromError()` knows `dl` only when
+  given the attempt's context, and a ceiling other than a day only when given it too.
+- **Breakers.** By default a failure the policy does not retry counts as a success for the
+  circuit breaker, and one it retries as a failure. A `BreakerVerdictInterface` given to
+  `withGuard()` decides instead, given the outcome and whether the policy retries it
+  (`ServiceFailureVerdict`: what the policy retries, a 408, 429 or 5xx read from a response,
+  transport tags, and errors that show the service unreachable are failures; an exception code
+  alone never is). It never changes the scheduler's decision for an attempt; through the breaker
+  it changes whether the run goes on. `Retry` asks the breaker before each attempt and the budget before each retry.
   After a retryable failure it checks the breaker's state before sleeping: anything but
   closed ends the run at once with `CircuitOpen` and the operation's last error, without
   spending a budget token or waiting out the delay. A guard that throws never replaces the

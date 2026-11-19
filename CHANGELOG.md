@@ -2,7 +2,70 @@
 
 ## Unreleased
 
-Planned as 2.3.0. No change to the gohany/retry interfaces and no method removed; every
+Planned as 2.4.0. Additive: no change to retries, sleeps, breaker reports or logs for 2.3
+callers that do not use the new arguments, and none to the gohany/retry interfaces. The one
+change without them is which random draws a seeded `fromError()` makes (under Changed).
+
+### Added
+
+- **A breaker verdict.** `Retry::withGuard()` takes an optional fourth argument, a
+  `Contracts\BreakerVerdictInterface`. Without one, as before, a failure the policy does not
+  retry is a success for the breaker and one it retries is a failure, so a refused connection
+  under `on=5xx` never opened the circuit, and a half-open probe that failed that way closed it.
+  With one, each failed attempt tells the breaker what the verdict answers, given the outcome
+  and the policy's answer (`isServiceFailure($outcome, $retryable)`).
+  `Breaker\ServiceFailureVerdict` counts what the policy retries, a 408, 429 or 5xx read from a
+  response at any depth of the error's `getPrevious()` chain, the tags `ETIMEDOUT`,
+  `ECONNRESET`, `ECONNREFUSED`, `NETWORK_ERROR` and `RATE_LIMITED` (pass more for your own
+  rules), and, when no response was read, errors that show the service unreachable: DNS
+  failures, refused, reset or lost connections, `MySQL server has gone away`, too many
+  connections, a phpredis read error, a broken pipe, a certificate failure. An exception code
+  is never read as a status, so a validation error never opens the circuit. By default the
+  verdict only adds failures to what the breaker hears without one;
+  `new ServiceFailureVerdict(countRetryable: false)` counts the service's answer alone.
+  The verdict never changes the scheduler's decision for an attempt (retry or not, the delay,
+  its give-up reason); through the breaker it changes whether the run goes on. A failure it
+  counts is logged as `retry.failure` at `warning` even when the policy does not retry it. A
+  verdict that throws falls back to the policy's answer for that attempt and is logged as
+  `retry.guard_error` with `call` `verdict`.
+- **`RtryAttemptOutcome::statusFromResponse()`** says whether `statusCode()` was read from an
+  HTTP response (true), from an exception code or a rule's constant (false), or is not known
+  (null). `failure()` takes it as an optional fifth argument; `fromMetadata()` takes it from
+  Rtry's `FailureMetadata`. The classifier's `FailureMetadata::isFromResponse()` is now false
+  when a later rule's status replaced the response's.
+- **`RtryScheduler::outcome($error, $policy, $context, $classifier = null)`** builds the
+  outcome for `next()` on the durable path from the scheduler's own clock, randomness and
+  ceiling, the context's attempt number and `dl`, and the policy's classifier. With a ceiling
+  set on the scheduler alone, `RtryAttemptOutcome::fromError()` assumed a day: a week-long
+  ceiling dropped the spread above a two-day `Retry-After`, and an hour-long one gave up on a
+  `Retry-After: 3600`. `fromError()` keeps its signature; the README's durable example now
+  uses `outcome()`.
+
+### Changed
+
+- `RtryAttemptOutcome::fromError()` (and so `RtryScheduler::outcome()`) no longer draws from
+  the `Randomizer` when there is nothing to spread (no server time, or `fh=0`), so a seeded
+  durable run gives the same delays as `Retry` with the same seed. The spread's distribution
+  is unchanged. With `fh=0` the outcome's `notBeforeUnixMs()` is the server's time unspread;
+  the scheduler ignores it there either way.
+
+### Tests
+
+- `VerdictSignalsTest`: the cases from the PR #7 hostile review. Code-only statuses (a
+  validation error with code 500, SMTP 550, AMQP 530) keep the circuit closed; a status read
+  from a response counts at any depth; untagged outages count and reopen a half-open circuit;
+  five verdicts give the same attempts, sleeps and give-up reasons for six errors; a verdict
+  that throws on a failure the policy does not retry reports a success; a seeded durable run
+  matches `Retry`.
+- Twelve 2.3.0 edges that were right but untested are pinned: a Laravel response whose
+  `headers()` throws, a status below 100 on its `$response`, `getResponse()` read before
+  `$response`, `RATE_LIMITED` on a 408 and a 599 and not on a 600, `X-RateLimit-Remaining: 1`
+  and a non-numeric remaining count, "lock timeout" in a `RuntimeException` message, an errno
+  name with a letter on either side, and `fromError()`'s ceiling argument.
+
+## 2.3.0 — 2026-11-18
+
+No change to the gohany/retry interfaces and no method removed; every
 constructor and method change is an optional argument. Some behaviour changes on purpose. Each
 is a fix for a failure that retried when it should not have, or the reverse. They are listed
 under Changed so you can check them against your specs.
@@ -10,7 +73,7 @@ under Changed so you can check them against your specs.
 ### Changed
 
 - **A status read from an HTTP response decides, wherever it sits on the error.** Rtry looks
-  along the `getPrevious()` chain for a response (`getResponse()`, PSR-7 or Symfony-shaped)
+  along the `getPrevious()` chain for a response (`getResponse()`, PSR-7 or Symfony-shaped),
   Laravel's `RequestException` `$response` property (`status()`, `headers()`), or a status
   accessor (`getStatusCode()`, `getHttpStatus()`, `getHttpStatusCode()`). A
   retryable status (408, 429, 5xx) keeps the error's transport tags, as in 2.2. Any other

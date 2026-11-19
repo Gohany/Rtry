@@ -267,6 +267,10 @@ final class PreTagFindingsTest extends TestCase
         yield 'a setting, not a timeout' => [new \RuntimeException('statement timeout is set to 0')];
         yield 'errno name inside a word' => [new \RuntimeException('XECONNREFUSEDX')];
         yield 'validation' => [new \InvalidArgumentException('lock timeout must be positive')];
+        // A RuntimeException's message is read, so this pins 'due to lock timeout', not 'lock timeout'.
+        yield 'a lock timeout setting, not a lock failure' => [new \RuntimeException('lock timeout must be positive')];
+        yield 'errno name with a letter before it' => [new \RuntimeException('XECONNREFUSED')];
+        yield 'errno name with a letter after it' => [new \RuntimeException('ECONNREFUSEDX')];
     }
 
     #[DataProvider('notDriverErrors')]

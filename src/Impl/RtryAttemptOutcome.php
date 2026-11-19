@@ -25,6 +25,7 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
         private readonly ?int $statusCode,
         private readonly array $tags,
         private readonly ?int $notBeforeUnixMs,
+        private readonly ?bool $statusFromResponse = null,
     ) {
     }
 
@@ -33,15 +34,22 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
         return new self(true, $result, null, null, [], null);
     }
 
-    /** @param list<string> $tags */
-    public static function failure(Throwable $error, ?int $statusCode = null, array $tags = [], ?int $notBeforeUnixMs = null): self
+    /**
+     * @param list<string> $tags
+     * @param bool|null $statusFromResponse whether $statusCode was read from an HTTP response the
+     *        error carries (true) or not (false: an exception code, a rule's constant); null when
+     *        you do not say, and a breaker verdict then looks for a response on $error itself
+     */
+    public static function failure(Throwable $error, ?int $statusCode = null, array $tags = [], ?int $notBeforeUnixMs = null, ?bool $statusFromResponse = null): self
     {
-        return new self(false, null, $error, $statusCode, array_values($tags), $notBeforeUnixMs);
+        return new self(false, null, $error, $statusCode, array_values($tags), $notBeforeUnixMs, $statusFromResponse);
     }
 
     /**
      * Classifies a caught error (status, tags, Retry-After), for callers that schedule a
-     * durable retry with RtryScheduler::next() instead of running Retry.
+     * durable retry with RtryScheduler::next() instead of running Retry. Prefer
+     * RtryScheduler::outcome(): it passes the scheduler's clock, randomness and ceiling, the
+     * attempt number and the policy's classifier for you, so none of them is set twice.
      *
      * Pass the policy and the failed attempt's number so a server's Retry-After is spread
      * above, never below (RtryScheduler::headerSpreadMs()): rows told the same Retry-After
@@ -51,7 +59,8 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
      * fits inside its remainingBudgetMs() (dl), the spread then stays inside it, as in Retry.
      * Without it the spread can push a wait that fits past dl, and next() gives up. The spread
      * also never pushes a wait that fits the scheduler's ceiling past it; pass
-     * $maxHeaderWaitMs when your RtryScheduler has a ceiling other than the default day.
+     * $maxHeaderWaitMs when your RtryScheduler has a ceiling other than the default day, or the
+     * spread can push a wait that fits it over (a give-up) or be dropped at a longer one.
      */
     public static function fromError(
         Throwable $error,
@@ -66,7 +75,8 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
         $metadata = ($classifier ?? RuleBasedFailureClassifier::default())->classify($error);
         $now = Clock::nowMs($clock ?? new NativeClock());
         $outcome = self::fromMetadata($error, $metadata, $now);
-        if ($policy === null) {
+        if ($policy === null || !$policy->followHeaders() || $outcome->notBeforeUnixMs === null) {
+            // Nothing to spread, so nothing drawn: a seeded durable run gives Retry's delays.
             return $outcome;
         }
         $remaining = $context?->remainingBudgetMs();
@@ -81,7 +91,9 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
     /**
      * A failure from classifier metadata. A relative Retry-After becomes an absolute time:
      * the later of the server's date and now + its delta. Waits beyond HeaderWaits' bounds are
-     * pinned to them (the scheduler gives up on them), so no value can overflow.
+     * pinned to them (the scheduler gives up on them), so no value can overflow. Rtry's own
+     * FailureMetadata says whether its status was read from a response; other metadata leaves
+     * statusFromResponse() null.
      */
     public static function fromMetadata(Throwable $error, FailureMetadataInterface $metadata, int $nowUnixMs): self
     {
@@ -94,7 +106,8 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
             $fromDelta = HeaderWaits::clampEpoch(max(0, $nowUnixMs) + HeaderWaits::clampDelta($minDelay));
             $notBefore = $notBefore === null ? $fromDelta : max($notBefore, $fromDelta);
         }
-        return self::failure($error, $metadata->getStatusCode(), $metadata->getTags(), $notBefore);
+        $fromResponse = $metadata instanceof FailureMetadata ? $metadata->isFromResponse() : null;
+        return self::failure($error, $metadata->getStatusCode(), $metadata->getTags(), $notBefore, $fromResponse);
     }
 
     /**
@@ -124,7 +137,7 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
         if ($spread <= 0) {
             return $this;
         }
-        return new self(false, null, $this->error, $this->statusCode, $this->tags, $notBefore + $spread);
+        return new self(false, null, $this->error, $this->statusCode, $this->tags, $notBefore + $spread, $this->statusFromResponse);
     }
 
     public function isSuccess(): bool
@@ -155,5 +168,14 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
     public function notBeforeUnixMs(): ?int
     {
         return $this->notBeforeUnixMs;
+    }
+
+    /**
+     * Whether statusCode() was read from an HTTP response the error carries: true, false (an
+     * exception code or a rule's constant, never proof of HTTP), or null when not known.
+     */
+    public function statusFromResponse(): ?bool
+    {
+        return $this->statusFromResponse;
     }
 }
