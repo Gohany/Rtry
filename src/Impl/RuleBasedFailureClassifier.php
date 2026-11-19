@@ -25,12 +25,12 @@ use Gohany\Rtry\Impl\Rules\ResponseStatusRule;
  *   number, deadlock SQLSTATEs and vendor codes, errno names (ECONNREFUSED, ETIMEDOUT,
  *   ECONNRESET), and specific phrases ("connection refused", "timed out", "deadlock found",
  *   driver timeouts such as PostgreSQL's "canceling statement due to statement timeout"),
- *   never a bare word such as "timeout" or "refused". A
- *   LogicException or an \Error (TypeError, ValueError) is a bug or a validation error: its
- *   message is never read for tags. Nor is the message of a database's answer about the values
- *   it was sent, or of an error wrapping one (DatabaseAnswer: an answering SQLSTATE class, or a
- *   MySQL server error number such as 1366), since such a message echoes them: "Duplicate entry
- *   'timed out'" and "Incorrect integer value: 'timed out'" run once. Deadlocks and lock
+ *   never a bare word such as "timeout" or "refused". A LogicException or an \Error
+ *   (TypeError, ValueError) is a bug or a validation error: its message is never read, for tags
+ *   or for a SQLSTATE. Nor is the message of a database's answer about the values it was sent,
+ *   or of an error wrapping one that quotes it (DatabaseAnswer: an answering SQLSTATE class, or
+ *   a MySQL server error number such as 1366), since such a message echoes them: "Duplicate
+ *   entry 'timed out'" and "Incorrect integer value: 'timed out'" run once. Deadlocks and lock
  *   timeouts get their tags from their SQLSTATE, number and the server's own text instead.
  * - Tags from rules you add are kept whatever the status.
  */
@@ -265,7 +265,7 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
     private function collectTags(\Throwable $e): array
     {
         $tags = [];
-        $unread = DatabaseAnswer::unreadDepth($e, self::MAX_DEPTH);
+        $unread = DatabaseAnswer::unread($e, self::MAX_DEPTH);
         for ($t = $e, $depth = 0; $t !== null && $depth < self::MAX_DEPTH; $t = $t->getPrevious(), $depth++) {
             foreach (self::TRANSPORT_TYPES as $type) {
                 if ($t instanceof $type) {
@@ -283,9 +283,9 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
 
             // A LogicException or an \Error is a bug or a validation error, whatever it says; a
             // database's answer (a duplicate key, a value MySQL could not take) echoes the values
-            // it was sent, and so does an error wrapping one, so their words are not the
-            // caller's to choose tags with. Errors below the answer are still read.
-            if ($t instanceof \LogicException || $t instanceof \Error || $depth < $unread) {
+            // it was sent, and so does an error wrapping one that quotes it, so their words are
+            // not the caller's to choose tags with. Other errors, above or below, are read.
+            if ($t instanceof \LogicException || $t instanceof \Error || isset($unread[$depth])) {
                 continue;
             }
             $message = strtolower((string) $t->getMessage());

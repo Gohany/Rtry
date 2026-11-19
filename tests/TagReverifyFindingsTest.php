@@ -295,12 +295,37 @@ final class TagReverifyFindingsTest extends TestCase
         self::assertSame([], self::tags($error));
     }
 
+    public function testAWrapperQuotingTheAnswerWithoutItsTrailingNewlineIsNotRead(): void
+    {
+        // pdo_pgsql's text can end in a newline; a wrapper that trims it still quotes the answer.
+        $text = "ERROR:  duplicate key value violates unique constraint \"t_name_key\"\nDETAIL:  Key (name)=(broken pipe) already exists.\n";
+        $pdo = PdoShaped::make("SQLSTATE[23505]: Unique violation: 7 $text", '23505', ['23505', 7, $text]);
+        self::assertFalse(self::counts(new \RuntimeException('Saving failed: ' . rtrim($pdo->getMessage()), 0, $pdo)));
+    }
+
     public function testAWrapperQuotingTheAnswerInAnotherErrorAboveItIsNotRead(): void
     {
         // The middle error is not read: it quotes the answer. The outer one only quotes the middle one's text.
         $pdo = self::duplicate('timed out');
         $error = new \RuntimeException('Import row 3: ' . 'Saving failed: ' . $pdo->getMessage(), 0, new \RuntimeException('Saving failed: ' . $pdo->getMessage(), 0, $pdo));
         self::assertSame([], self::tags($error));
+    }
+
+    public function testAWrapperQuotingAMessageOnlyAnswerIsNotRead(): void
+    {
+        // PDO's text after the prefix is empty here, so only the answer's message is quoted.
+        $error = new \RuntimeException('Saving failed: SQLSTATE[23000]: broken pipe', 0, new \RuntimeException('SQLSTATE[23000]: broken pipe'));
+        self::assertFalse(self::counts($error));
+    }
+
+    public function testAValidationErrorsWordsDoNotMakeALockTimeout(): void
+    {
+        // A real timeout, over a validation error naming a lock timeout, over SQL Server's 1205.
+        $dblib = DbErrors::pdo('HY000', 1205, 'Transaction (Process ID 52) was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.');
+        // "Read timed out" gives ETIMEDOUT but is not UnavailableEvidence on its own (cURL 28 would be).
+        $error = new \RuntimeException('Read timed out after 30 s', 0, new \LogicException('Lock wait timeout exceeded is not a valid status', 0, $dblib));
+        self::assertSame(['DEADLOCK', 'ETIMEDOUT'], self::tags($error));
+        self::assertTrue(self::counts($error));
     }
 
     // ---- Should-fix 2: request text at the start of a message (documented, not covered) ------
@@ -342,6 +367,12 @@ final class TagReverifyFindingsTest extends TestCase
         self::assertSame(['ETIMEDOUT', 'DEADLOCK'], $order(DbErrors::pdo('HY000', 3133, 'Service lock wait timeout exceeded.')));
     }
 
+    public function testAPdoExceptionsDeadlockSqlstateComesFirstAsIn240(): void
+    {
+        $error = PdoShaped::make('SQLSTATE[40001]: Serialization failure: 3133 Service lock wait timeout exceeded.', '40001', ['40001', 3133, 'Service lock wait timeout exceeded.']);
+        self::assertSame(['DEADLOCK', 'ETIMEDOUT'], RuleBasedFailureClassifier::default()->classify($error)->getTags());
+    }
+
     #[RequiresPhpExtension('mysqli')]
     public function testMysqliLockTimeoutTagsKeep240sOrder(): void
     {
@@ -361,6 +392,8 @@ final class TagReverifyFindingsTest extends TestCase
         // And errorInfo's text is read when the message is rewritten.
         $rewritten = PdoShaped::make('Statement failed', 'HY000', ['HY000', 1205, 'Lock wait timeout exceeded; try restarting transaction']);
         self::assertSame(['DEADLOCK', 'ETIMEDOUT'], self::tags($rewritten));
+        // Leading whitespace before the driver's text is not part of its start.
+        self::assertSame(['DEADLOCK', 'ETIMEDOUT'], self::tags(PdoShaped::make('Statement failed', 'HY000', ['HY000', 1205, '  Lock wait timeout exceeded; try restarting transaction'])));
     }
 
     public function testDbalsLockWaitTimeoutTypeIsALockTimeout(): void
@@ -446,7 +479,7 @@ final class TagReverifyFindingsTest extends TestCase
     {
         // SQL Server's 1205 (deadlock victim) through pdo_dblib, under a real timeout.
         $dblib = DbErrors::pdo('HY000', 1205, 'Transaction (Process ID 52) was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.');
-        $error = new \RuntimeException('cURL error 28: Operation timed out after 30001 milliseconds', 0, $dblib);
+        $error = new \RuntimeException('Read timed out after 30 s', 0, $dblib);
         self::assertSame(['DEADLOCK', 'ETIMEDOUT'], self::tags($error));
         self::assertTrue(self::counts($error));
     }

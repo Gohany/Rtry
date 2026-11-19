@@ -14,11 +14,13 @@ use Gohany\Rtry\Impl\DatabaseAnswer;
  * Never from an exception code alone: a code counts only on a database driver's own exception
  * (PDOException, mysqli_sql_exception), as its connection error number; a SQLSTATE counts from
  * a database error's own fields (errorInfo, a string code, getSqlState()) or a message. The
- * message of a LogicException or an \Error (a bug or a validation error) is never read; its
- * previous errors still are. Nor is the message of a database's answer (DatabaseAnswer: a
- * duplicate key, a value MySQL could not take) or of any error wrapping one: "Duplicate entry
- * 'broken pipe'" and "Incorrect integer value: 'broken pipe'" echo what the caller sent.
- * Evidence from types, SQLSTATEs and driver numbers counts at any depth, answer or not.
+ * message of a LogicException or an \Error (a bug or a validation error) is never read, not
+ * even for a SQLSTATE at its start; its previous errors still are. Nor is the message of a
+ * database's answer (DatabaseAnswer: a duplicate key, a value MySQL could not take) or of an
+ * error wrapping one that quotes it: "Duplicate entry 'broken pipe'" and "Incorrect integer
+ * value: 'broken pipe'" echo what the caller sent. An error above an answer that does not quote
+ * it is read. Evidence from types, SQLSTATEs and driver numbers counts at any depth, answer or
+ * not.
  *
  * @internal
  */
@@ -39,9 +41,10 @@ final class UnavailableEvidence
     /**
      * MySQL / MariaDB: 1040 too many connections, 1053 server shutdown in progress, 2002 and
      * 2003 cannot connect, 2005 unknown host, 2006 server has gone away, 2013 and 2055 lost
-     * connection.
+     * connection, 4031 disconnected for inactivity (what PHP 8.5's mysqlnd reports where 8.2's
+     * says 2006).
      */
-    public const MYSQL_CODES = [1040, 1053, 2002, 2003, 2005, 2006, 2013, 2055];
+    public const MYSQL_CODES = [1040, 1053, 2002, 2003, 2005, 2006, 2013, 2055, 4031];
 
     /**
      * SQLSTATE class 08 (connection exception), 57P01-57P03 (PostgreSQL shutting down or not
@@ -69,6 +72,7 @@ final class UnavailableEvidence
         'server closed the connection', 'terminating connection due to administrator command',
         'the database system is shutting down', 'the database system is starting up',
         'read error on connection', 'redis server went away', 'socket error on read',
+        'no connection to the server', // pdo_pgsql, the query after the backend was ended
         // TLS
         'ssl certificate problem', 'certificate has expired', 'certificate verify failed',
         'ssl_connect', 'ssl handshake', 'tls handshake',
@@ -76,16 +80,16 @@ final class UnavailableEvidence
 
     public static function in(\Throwable $e): bool
     {
-        $unread = DatabaseAnswer::unreadDepth($e, self::MAX_DEPTH);
+        $unread = DatabaseAnswer::unread($e, self::MAX_DEPTH);
         for ($t = $e, $depth = 0; $t !== null && $depth < self::MAX_DEPTH; $t = $t->getPrevious(), $depth++) {
-            if (self::one($t, $depth >= $unread)) {
+            if (self::one($t, !isset($unread[$depth]))) {
                 return true;
             }
         }
         return false;
     }
 
-    /** @param bool $readWords false for a database's answer and the errors that wrap it */
+    /** @param bool $readWords false for a database's answer and the errors that quote it */
     private static function one(\Throwable $t, bool $readWords): bool
     {
         foreach (self::TYPES as $type) {

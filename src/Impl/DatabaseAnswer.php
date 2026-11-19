@@ -13,27 +13,30 @@ use Gohany\Rtry\Impl\Breaker\UnavailableEvidence;
  *   writes it (a SQLSTATE anywhere else in a message is request text: a URL, echoed SQL);
  * - its error number: a PDOException's errorInfo[1] or int code, a mysqli_sql_exception's code,
  *   or the number PDO writes after that SQLSTATE ("General error: 1366", "[1049]");
- * - the driver's own text: errorInfo[2], a mysqli_sql_exception's message, or what follows
- *   PDO's prefix. Only its start is compared, which the server writes, never a value.
+ * - the driver's own text: errorInfo[2], a mysqli_sql_exception's message, and what follows
+ *   PDO's prefix. Only their start is compared, which the server writes, never a value.
+ *
+ * The message of a LogicException or an \Error (a bug or a validation error) is never read, so
+ * "SQLSTATE[08006] is not a valid coupon code" is nothing here; its fields still are.
  *
  * The database answered when nothing there says connection (SQLSTATE class 08, 57P01-57P03,
- * 53300, or one of UnavailableEvidence::MYSQL_CODES) and
+ * 53300, or one of UnavailableEvidence::MYSQL_CODES), its number is not one whose text is
+ * someone else's (READ_ANYWAY, PROXY_TEXTS), and
  *
  * - its SQLSTATE is in class 21 (cardinality), 22 (data), 23 (integrity constraint), 42
  *   (syntax or access rule), 44 (check option), 45 (MySQL's SIGNAL) or P0 (PostgreSQL's
  *   RAISE), or is 40001 or 40P01 (serialization failure, deadlock); or
  * - its number is a MySQL server error (1000 to 1999, 3000 to 5999). MySQL files many value
  *   errors under HY000 (1366 "Incorrect integer value: '...'", 1525, 1411, 1298, and the
- *   connect errors 1049 "Unknown database '...'" and 1045), so the class cannot tell. Except
- *   1105 "Unknown error", which Vitess, TiDB and proxies use for anything, outages included,
- *   1429 and 1430 (FEDERATED relaying its foreign source), and Oracle's ORA numbers, which
- *   PDO_OCI files under HY000 too (its text starts with the OCI call). Client errors (2000 to
- *   2999), proxies (ProxySQL's 9001 "Max connect timeout reached") and other databases'
- *   numbers fall outside and are read as before.
+ *   connect errors 1049 "Unknown database '...'" and 1045), so the class cannot tell. Not
+ *   Oracle's ORA numbers, which PDO_OCI files under HY000 too (its text, or the description
+ *   PDO writes before it, starts with the OCI call). Client errors (2000 to 2999), proxies'
+ *   numbers outside the range (ProxySQL's 9001 "Max connect timeout reached") and other
+ *   databases' numbers fall outside and are read as before.
  *
- * Such an error's message echoes what the caller sent, so neither it nor the message of any
- * error wrapping it (unreadDepth()) is read for words. The contention and timeouts the server's
- * own text names keep their tags (tags()).
+ * Such an error's message echoes what the caller sent, so neither it nor the message of an
+ * error wrapping it that quotes it (its message or the driver's text) is read for words
+ * (unread()). The contention and timeouts the server's own text names keep their tags (tags()).
  *
  * @internal
  */
@@ -44,34 +47,53 @@ final class DatabaseAnswer
     /** Serialization failure and PostgreSQL's deadlock: contention, the database answered. */
     private const CONTENTION_STATES = ['40001', '40P01'];
 
-    /** MySQL server numbers that are not the server's own answer (see the class docblock). */
-    private const READ_ANYWAY = [1105, 1429, 1430];
+    /**
+     * MySQL server numbers whose text is not the server's answer about what it was sent, read
+     * as before 2.4.1: 1105 "Unknown error", 1815 "Internal error: %s", 1317 "Query execution
+     * was interrupted", 1203 (max_user_connections) and 1041 (out of resources), which Vitess,
+     * TiDB and proxies send with their own text, outages included (Vitess: DEADLINE_EXCEEDED,
+     * CANCELED and ABORTED as 1317, INTERNAL as 1815, RESOURCE_EXHAUSTED as 1203 or 1041); and
+     * 1296, 1297, 1429 and 1430, an engine (FEDERATED, NDB) relaying another server's error.
+     */
+    private const READ_ANYWAY = [1041, 1105, 1203, 1296, 1297, 1317, 1429, 1430, 1815];
+
+    /**
+     * A proxy's own error under a number that is something else on a MySQL server, by that
+     * number and the start of the proxy's text: read as before 2.4.1. ProxySQL's query_timeout
+     * (MySQL 8.0 has no 1907; MariaDB's is about a generated column and stays an answer).
+     */
+    private const PROXY_TEXTS = [1907 => 'query execution was interrupted, query_timeout exceeded'];
 
     /** MySQL's 1213 deadlock and 1205 lock wait timeout; SQL Server's 1205 deadlock victim. */
     private const DEADLOCK_NUMBERS = [1205, 1213];
 
     /**
      * MySQL server errors whose own text, not a value, names contention or a timeout: the start
-     * of that text, the tags its words gave before 2.4.1 (now given by the number and that
-     * start), and whether it is a lock timeout (ServiceFailureVerdict drops its ETIMEDOUT).
+     * of that text, the tags its words gave before 2.4.1 in the order they gave them (now given
+     * by the number and that start), and whether it is a lock timeout (ServiceFailureVerdict
+     * drops its ETIMEDOUT).
      *
      * @var array<int, array{string, list<string>, bool}>
      */
     private const MYSQL_TEXT_TAGS = [
-        1205 => ['lock wait timeout exceeded', [FailureToken::DEADLOCK, FailureToken::ETIMEDOUT], true],
+        1205 => ['lock wait timeout exceeded', [FailureToken::ETIMEDOUT, FailureToken::DEADLOCK], true],
         1213 => ['deadlock found', [FailureToken::DEADLOCK], false],
         1614 => ['xa_rbdeadlock', [FailureToken::DEADLOCK], false],
         1639 => ['debug sync point wait timed out', [FailureToken::ETIMEDOUT], false],
         3058 => ['deadlock found', [FailureToken::DEADLOCK], false],
         3132 => ['deadlock found', [FailureToken::DEADLOCK], false],
-        3133 => ['service lock wait timeout exceeded', [FailureToken::DEADLOCK, FailureToken::ETIMEDOUT], true],
+        3133 => ['service lock wait timeout exceeded', [FailureToken::ETIMEDOUT, FailureToken::DEADLOCK], true],
         3699 => ['timeout exceeded in regular expression', [FailureToken::ETIMEDOUT], false],
         3781 => ['timeout exceeded for held statement', [FailureToken::ETIMEDOUT], false],
         3840 => ['redo log archiving start timed out', [FailureToken::ETIMEDOUT], false],
     ];
 
-    /** PDO's prefix: "SQLSTATE[HY000]: General error: 1366 text", "SQLSTATE[HY000] [1049] text". */
-    private const PDO_PREFIX = '~^SQLSTATE\[([0-9A-Za-z]{5})\](?:: [^:\n]*(?:: (\d+))?| \[(\d+)\])? ?(.*)~s';
+    /**
+     * PDO's prefix: "SQLSTATE[HY000]: General error: 1366 text", "SQLSTATE[HY000] [1049] text",
+     * "SQLSTATE[01002]: OCISessionBegin: ORA-01033: text". Groups: state, description, number,
+     * bracketed number, text.
+     */
+    private const PDO_PREFIX = '~^SQLSTATE\[([0-9A-Za-z]{5})\](?:: ([^:\n]*)(?:: (\d+))?| \[(\d+)\])? ?(.*)~s';
 
     /** PostgreSQL's lock_timeout (55P03), as the server's text starts. */
     private const PG_LOCK_TIMEOUT = '~^(?:error:\s+)?canceling statement due to lock timeout~';
@@ -83,28 +105,57 @@ final class DatabaseAnswer
         if ($id === null || self::isConnection($id)) {
             return false;
         }
+        $n = $id['number'];
+        if ($n !== null && !$id['oracle'] && (in_array($n, self::READ_ANYWAY, true) || self::isProxyText($n, $id['texts']))) {
+            return false;
+        }
         foreach ($id['states'] as $state) {
             if (in_array(substr($state, 0, 2), self::ANSWER_CLASSES, true) || in_array($state, self::CONTENTION_STATES, true)) {
                 return true;
             }
         }
-        $n = $id['number'];
         return $n !== null && !$id['oracle']
             && (($n >= 1000 && $n <= 1999) || ($n >= 3000 && $n <= 5999))
-            && !in_array($n, UnavailableEvidence::MYSQL_CODES, true)
-            && !in_array($n, self::READ_ANYWAY, true);
+            && !in_array($n, UnavailableEvidence::MYSQL_CODES, true);
     }
 
     /**
-     * How many errors, from the outermost along getPrevious(), are not read for words: the
-     * deepest database answer within $maxDepth and every error that wraps it. 0 when none.
+     * The depths, from the outermost error along getPrevious() and within $maxDepth, whose
+     * message is not read for words: each database answer, and each error above one whose
+     * message quotes it (the answer's message or the driver's text, in any case), as DBAL's
+     * wrappers, CodeIgniter's and "Saving failed: " . $e->getMessage() do. An error above an
+     * answer that does not quote it (a cache's read error thrown in a finally while the answer
+     * unwinds) is read: its words are its own.
+     *
+     * @return array<int, true>
      */
-    public static function unreadDepth(\Throwable $e, int $maxDepth): int
+    public static function unread(\Throwable $e, int $maxDepth): array
     {
-        $unread = 0;
+        $chain = [];
         for ($t = $e, $depth = 0; $t !== null && $depth < $maxDepth; $t = $t->getPrevious(), $depth++) {
+            $chain[] = $t;
+        }
+        $unread = [];
+        $quotes = [];
+        for ($depth = count($chain) - 1; $depth >= 0; $depth--) {
+            $t = $chain[$depth];
             if (self::is($t)) {
-                $unread = $depth + 1;
+                $unread[$depth] = true;
+                $id = self::identity($t);
+                foreach ([strtolower($t->getMessage()), ...($id['texts'] ?? [])] as $quote) {
+                    $quote = trim($quote);
+                    if ($quote !== '') {
+                        $quotes[] = $quote;
+                    }
+                }
+                continue;
+            }
+            $message = strtolower($t->getMessage());
+            foreach ($quotes as $quote) {
+                if (str_contains($message, $quote)) {
+                    $unread[$depth] = true;
+                    break;
+                }
             }
         }
         return $unread;
@@ -118,7 +169,9 @@ final class DatabaseAnswer
     }
 
     /**
-     * DEADLOCK and ETIMEDOUT from $t's own SQLSTATE, number and the start of the server's text.
+     * DEADLOCK and ETIMEDOUT from $t's own SQLSTATE, number and the start of the server's text,
+     * in the order 2.4.0 gave them: a PDOException's errorInfo SQLSTATE or number first, then
+     * the server's words.
      *
      * @return list<string>
      */
@@ -128,18 +181,17 @@ final class DatabaseAnswer
         if ($id === null) {
             return [];
         }
+        $n = $id['oracle'] ? null : $id['number'];
+        $deadlock = array_intersect($id['states'], self::CONTENTION_STATES) !== [] || in_array($n, self::DEADLOCK_NUMBERS, true);
         $tags = [];
-        if (array_intersect($id['states'], self::CONTENTION_STATES) !== []) {
+        if ($deadlock && self::pdoFieldsSayDeadlock($t)) {
             $tags[] = FailureToken::DEADLOCK;
         }
-        $n = $id['number'];
-        if ($n !== null && !$id['oracle']) {
-            if (in_array($n, self::DEADLOCK_NUMBERS, true)) {
-                $tags[] = FailureToken::DEADLOCK;
-            }
-            if (isset(self::MYSQL_TEXT_TAGS[$n]) && str_starts_with($id['text'], self::MYSQL_TEXT_TAGS[$n][0])) {
-                $tags = array_merge($tags, self::MYSQL_TEXT_TAGS[$n][1]);
-            }
+        if ($n !== null && isset(self::MYSQL_TEXT_TAGS[$n]) && self::startsWith($id['texts'], self::MYSQL_TEXT_TAGS[$n][0])) {
+            $tags = array_merge($tags, self::MYSQL_TEXT_TAGS[$n][1]);
+        }
+        if ($deadlock) {
+            $tags[] = FailureToken::DEADLOCK;
         }
         return array_values(array_unique($tags));
     }
@@ -147,14 +199,23 @@ final class DatabaseAnswer
     /**
      * Whether an error on $e's chain is a lock timeout: MySQL's 1205 or 3133 by number and the
      * start of the server's text, PostgreSQL's 55P03 "canceling statement due to lock timeout",
-     * or an error with no database fields whose message starts with those words (a driver's
-     * message rethrown).
+     * Doctrine DBAL's LockWaitTimeoutException, or an error with no database fields whose
+     * message starts with those words (a driver's message rethrown).
      */
     public static function isLockTimeout(\Throwable $e, int $maxDepth): bool
     {
         for ($t = $e, $depth = 0; $t !== null && $depth < $maxDepth; $t = $t->getPrevious(), $depth++) {
+            if (
+                class_exists(\Doctrine\DBAL\Exception\LockWaitTimeoutException::class)
+                && $t instanceof \Doctrine\DBAL\Exception\LockWaitTimeoutException
+            ) {
+                return true;
+            }
             $id = self::identity($t);
             if ($id === null) {
+                if ($t instanceof \LogicException || $t instanceof \Error) {
+                    continue;
+                }
                 $message = strtolower(ltrim($t->getMessage()));
                 if (str_starts_with($message, 'lock wait timeout exceeded') || preg_match(self::PG_LOCK_TIMEOUT, $message)) {
                     return true;
@@ -162,17 +223,55 @@ final class DatabaseAnswer
                 continue;
             }
             $n = $id['number'];
-            if ($n !== null && !$id['oracle'] && (self::MYSQL_TEXT_TAGS[$n][2] ?? false) && str_starts_with($id['text'], self::MYSQL_TEXT_TAGS[$n][0])) {
+            if ($n !== null && !$id['oracle'] && (self::MYSQL_TEXT_TAGS[$n][2] ?? false) && self::startsWith($id['texts'], self::MYSQL_TEXT_TAGS[$n][0])) {
                 return true;
             }
-            if (preg_match(self::PG_LOCK_TIMEOUT, $id['text'])) {
+            foreach ($id['texts'] as $text) {
+                if (preg_match(self::PG_LOCK_TIMEOUT, $text)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** @param list<string> $texts */
+    private static function startsWith(array $texts, string $start): bool
+    {
+        foreach ($texts as $text) {
+            if (str_starts_with($text, $start)) {
                 return true;
             }
         }
         return false;
     }
 
-    /** @param array{states: list<string>, number: ?int, text: string, oracle: bool} $id */
+    /** @param list<string> $texts */
+    private static function isProxyText(int $n, array $texts): bool
+    {
+        return isset(self::PROXY_TEXTS[$n]) && self::startsWith($texts, self::PROXY_TEXTS[$n]);
+    }
+
+    /**
+     * Whether a PDOException's own fields name a deadlock the way 2.4.0 read them first: its
+     * SQLSTATE (errorInfo[0], else a string code) 40001 or 40P01, or errorInfo[1] 1205 or 1213.
+     */
+    private static function pdoFieldsSayDeadlock(\Throwable $t): bool
+    {
+        if (!$t instanceof \PDOException) {
+            return false;
+        }
+        $info = is_array($t->errorInfo) ? $t->errorInfo : [];
+        $code = $t->getCode();
+        $state = isset($info[0]) && is_string($info[0]) && $info[0] !== '' ? $info[0] : (is_string($code) ? $code : '');
+        if (in_array(strtoupper($state), self::CONTENTION_STATES, true)) {
+            return true;
+        }
+        $number = $info[1] ?? null;
+        return (is_int($number) || (is_string($number) && ctype_digit($number))) && in_array((int) $number, self::DEADLOCK_NUMBERS, true);
+    }
+
+    /** @param array{states: list<string>, number: ?int, texts: list<string>, oracle: bool} $id */
     private static function isConnection(array $id): bool
     {
         foreach ($id['states'] as $state) {
@@ -184,16 +283,18 @@ final class DatabaseAnswer
     }
 
     /**
-     * What $t carries as a database error, or null when nothing. States are upper-cased; text
-     * is the driver's own message, lower-cased ('' when not known).
+     * What $t carries as a database error, or null when nothing. States are upper-cased; texts
+     * are the driver's own messages, lower-cased: errorInfo[2] or a mysqli_sql_exception's
+     * message, then what follows PDO's prefix in the message.
      *
-     * @return array{states: list<string>, number: ?int, text: string, oracle: bool}|null
+     * @return array{states: list<string>, number: ?int, texts: list<string>, oracle: bool}|null
      */
     private static function identity(\Throwable $t): ?array
     {
         $states = [];
         $number = null;
-        $text = null;
+        $texts = [];
+        $description = '';
         if ($t instanceof \PDOException) {
             $info = $t->errorInfo;
             if (is_array($info)) {
@@ -204,7 +305,7 @@ final class DatabaseAnswer
                     $number = (int) $info[1];
                 }
                 if (isset($info[2]) && is_string($info[2])) {
-                    $text = $info[2];
+                    $texts[] = $info[2];
                 }
             }
             $code = $t->getCode();
@@ -216,7 +317,7 @@ final class DatabaseAnswer
         }
         if ($t instanceof \mysqli_sql_exception) {
             $number = $t->getCode() !== 0 ? (int) $t->getCode() : null;
-            $text = $t->getMessage();
+            $texts[] = $t->getMessage();
         }
         if (method_exists($t, 'getSqlState')) {
             try {
@@ -228,23 +329,31 @@ final class DatabaseAnswer
                 // no SQLSTATE to go on
             }
         }
-        if (preg_match(self::PDO_PREFIX, $t->getMessage(), $m)) {
+        // A LogicException or an \Error is a bug or a validation error: its message may start
+        // with the value it rejects ("SQLSTATE[08006] is not a valid coupon code").
+        $readMessage = !($t instanceof \LogicException || $t instanceof \Error);
+        if ($readMessage && preg_match(self::PDO_PREFIX, $t->getMessage(), $m)) {
             $states[] = $m[1];
-            $n = ($m[2] ?? '') !== '' ? $m[2] : ($m[3] ?? '');
+            $description = strtolower(ltrim($m[2] ?? ''));
+            $n = ($m[3] ?? '') !== '' ? $m[3] : ($m[4] ?? '');
             if ($n !== '') {
                 $number ??= (int) $n;
             }
-            $text ??= $m[4] ?? '';
+            $texts[] = $m[5] ?? '';
         }
         if ($states === [] && $number === null) {
             return null;
         }
-        $text = strtolower(ltrim($text ?? ''));
+        $texts = array_map(static fn (string $text): string => strtolower(ltrim($text)), $texts);
+        $oracle = str_starts_with($description, 'oci');
+        foreach ($texts as $text) {
+            $oracle = $oracle || str_starts_with($text, 'oci');
+        }
         return [
             'states' => array_values(array_unique(array_map('strtoupper', $states))),
             'number' => $number,
-            'text' => $text,
-            'oracle' => str_starts_with($text, 'oci'),
+            'texts' => array_values($texts),
+            'oracle' => $oracle,
         ];
     }
 }
