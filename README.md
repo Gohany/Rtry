@@ -100,7 +100,10 @@ Rtry turns a thrown error into a status and tags with a `RuleBasedFailureClassif
   Doctrine's `DeadlockException`, "Deadlock found", PostgreSQL's lock timeout). A bare
   "timeout" or "refused" is not evidence: "timeout must be a positive integer" and "Payment
   refused by issuer" run once. A `LogicException` or an `\Error` (`TypeError`, `ValueError`)
-  never gets tags from its message: it is a bug or a validation error.
+  never gets tags from its message: it is a bug or a validation error. Nor does a database
+  error whose SQLSTATE says the database answered about the values it was sent (class 21, 22,
+  23, 42, 44, 45 or P0): `Duplicate entry 'timed out' for key 'name'` echoes a submitted value
+  and runs once.
 - `Retry-After` on any response, and `RateLimit-Reset(-After)` and
   `X-RateLimit-Reset(-After|-Ms)` on a 429, a 503 or a response whose
   `X-RateLimit-Remaining` (or `RateLimit-Remaining`) is 0, set the next wait. Many APIs send
@@ -341,10 +344,19 @@ $results = $retry->try(fn ($attempt) => $client->get($url), (new RtryPolicyFacto
   (`[1040]`), a PostgreSQL shutdown, a phpredis `read error on connection`, a broken pipe, or a
   certificate failure (`cURL error 60`). It reads transport exception types, cURL error numbers,
   errno names, SQLSTATE class 08 and a database driver's own connection error number. It never
-  reads the message of a `LogicException` or an `\Error`.
+  reads the message of a `LogicException` or an `\Error`, nor of a database error whose
+  SQLSTATE says the database answered about the values it was sent (class 21, 22, 23, 42, 44,
+  45 or P0): MySQL's `Duplicate entry 'broken pipe'` echoes what the caller submitted.
 
-Everything else (a 404, a 422, a `DEADLOCK`, a validation error) is a success, unless the
-policy retries it. An outage none of these names, such as an SDK's own connection error, counts
+Where a status came from: an outcome whose `statusFromResponse()` is true read it from a
+response, and the verdict trusts it. Otherwise (false says only that the status is an exception
+code or a rule's constant) the verdict reads the response on the error itself, so a 503 counts
+under any classifier, and a 404 whose status a rule replaced stays a 404.
+
+Everything else (a 404, a 422, a `DEADLOCK`, a lock wait timeout, a duplicate key, a validation
+error) is a success, unless the policy retries it. A lock wait timeout (MySQL 1205,
+PostgreSQL's lock timeout) is contention, as a deadlock is: the database answered. Its words
+also give it `ETIMEDOUT`, which the verdict does not count beside `DEADLOCK`. An outage none of these names, such as an SDK's own connection error, counts
 only if the policy retries it or you add the tag your rule gives it:
 `new ServiceFailureVerdict([...ServiceFailureVerdict::UNAVAILABLE_TAGS, 'SDK_TRANSPORT'])`.
 

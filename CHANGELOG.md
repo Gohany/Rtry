@@ -1,8 +1,57 @@
 # Changelog
 
-## Unreleased
+## 2.4.1 — Unreleased
 
-Planned as 2.4.0. Additive: no change to retries, sleeps, breaker reports or logs for 2.3
+Fixes to the breaker verdict's matching from the re-verification of PR #7. No public API
+changes. One retry change, for an error no one meant to retry: a database error whose SQLSTATE
+says the database answered about the values it was sent no longer gets transport tags from its
+message (under Fixed).
+
+### Fixed
+
+- **A real 503 on the error counts, whatever the classifier.** `ServiceFailureVerdict` read
+  `statusFromResponse()` false as "this error carries no response". False is also
+  `FailureMetadata`'s default, so under any classifier other than `default()`
+  (`new RuleBasedFailureClassifier([new MethodStatusRule()])`, or a classifier of your own
+  returning `new FailureMetadata(503)`) a 503 the error carried was a success, and a half-open
+  probe that got one closed the circuit. And when a rule replaced a 404's status, the verdict
+  read the 404's message: `Not found: /search?q=connection refused` counted. The verdict now
+  trusts only true; otherwise it reads the response on the error itself (false says only that
+  the status is not the response's). `statusFromResponse()` itself is unchanged.
+- **A database error that echoes what it was sent cannot open a circuit, or retry.** A
+  database error whose SQLSTATE is in class 21, 22, 23, 42, 44, 45 (MySQL's `SIGNAL`) or P0
+  (PostgreSQL's `RAISE`), from a `PDOException`'s `errorInfo` or code, a `getSqlState()` method
+  (mysqli, Doctrine DBAL's driver exceptions) or `SQLSTATE[…]` anywhere in the message, is not
+  read for words. MySQL echoes the submitted value, so
+  `SQLSTATE[23000]: … Duplicate entry 'broken pipe' for key 'products.name'` let anyone who
+  can submit a unique field open the database's circuit through the verdict, and
+  `Duplicate entry 'timed out'` got `ETIMEDOUT` from the classifier (since 2.3), so it retried
+  under `on=default` and opened the circuit without a verdict. Both now run once and count as
+  the database answering. Class 08, `HY000` and the rest are read as before.
+- **A MySQL code in a message ends at a digit boundary.** PDO_OCI's
+  `General error: 20060 … ORA-20060: credit limit exceeded` (an application error) was read as
+  MySQL 2006, "server has gone away".
+- **A lock wait timeout is contention, like a deadlock.** MySQL 1205 `Lock wait timeout
+  exceeded` and PostgreSQL's lock timeout get `DEADLOCK` and, from their words, `ETIMEDOUT`;
+  the verdict counted the `ETIMEDOUT`, so they opened the circuit under `on=5xx` while 1213
+  `Deadlock found` did not. The verdict no longer counts `ETIMEDOUT` beside `DEADLOCK`. Tags
+  and retries are unchanged: `on=DEADLOCK` and `on=ETIMEDOUT` still match a lock timeout.
+- The docs said a validation error never opens the circuit. It does when the policy retries
+  it (`InvalidArgumentException('…', 500)` under `on=default`), as in 2.3.
+
+### Tests
+
+- `ReVerifyFindingsTest`: each probe from the re-verification (the three classifiers, the
+  replaced 404, ORA-20060, duplicate entries echoing `broken pipe`, `timed out` and
+  `connection refused` under `on=5xx` and `on=default` with the attempts and sleeps recorded,
+  1205 against 1213), the four edges that survived mutation (a response without a status from
+  100 to 599, the verdict's reader, a SQLSTATE from `errorInfo` and from a string code), and
+  each entry of `UnavailableEvidence`'s cURL, errno, SQLSTATE and MySQL lists as the only
+  signal.
+
+## 2.4.0 — 2026-11-18
+
+Additive: no change to retries, sleeps, breaker reports or logs for 2.3
 callers that do not use the new arguments, and none to the gohany/retry interfaces. The one
 change without them is which random draws a seeded `fromError()` makes (under Changed).
 
@@ -20,7 +69,8 @@ change without them is which random draws a seeded `fromError()` makes (under Ch
   rules), and, when no response was read, errors that show the service unreachable: DNS
   failures, refused, reset or lost connections, `MySQL server has gone away`, too many
   connections, a phpredis read error, a broken pipe, a certificate failure. An exception code
-  is never read as a status, so a validation error never opens the circuit. By default the
+  is never read as a status, so a validation error does not open the circuit unless the policy
+  retries it. By default the
   verdict only adds failures to what the breaker hears without one;
   `new ServiceFailureVerdict(countRetryable: false)` counts the service's answer alone.
   The verdict never changes the scheduler's decision for an attempt (retry or not, the delay,

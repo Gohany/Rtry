@@ -27,7 +27,9 @@ use Gohany\Rtry\Impl\Rules\ResponseStatusRule;
  *   driver timeouts such as PostgreSQL's "canceling statement due to statement timeout"),
  *   never a bare word such as "timeout" or "refused". A
  *   LogicException or an \Error (TypeError, ValueError) is a bug or a validation error: its
- *   message is never read for tags.
+ *   message is never read for tags. Nor is the message of a database error whose SQLSTATE says
+ *   the database answered about the values it was sent (DatabaseAnswer: class 21, 22, 23, 42, 44,
+ *   45 or P0), since such a message echoes them: "Duplicate entry 'timed out'" runs once.
  * - Tags from rules you add are kept whatever the status.
  */
 final class RuleBasedFailureClassifier implements FailureClassifierInterface, RuleBasedClassifierInterface
@@ -271,8 +273,10 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
                 $tags[] = FailureToken::DEADLOCK;
             }
 
-            // A LogicException or an \Error is a bug or a validation error, whatever it says.
-            if ($t instanceof \LogicException || $t instanceof \Error) {
+            // A LogicException or an \Error is a bug or a validation error, whatever it says; a
+            // database error whose SQLSTATE says it answered (a duplicate key, bad data) echoes
+            // the values it was sent, so its words are not the caller's to choose tags with.
+            if ($t instanceof \LogicException || $t instanceof \Error || DatabaseAnswer::is($t)) {
                 continue;
             }
             $message = strtolower((string) $t->getMessage());

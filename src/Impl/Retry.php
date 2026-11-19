@@ -83,7 +83,8 @@ final class Retry implements RetryerInterface, RetryHooksInterface
      * verdict decides what each failed attempt tells the breaker, given the outcome and the
      * policy's answer: ServiceFailureVerdict counts what the policy retries plus 408, 429 and
      * 5xx read from a response and errors that show the service unreachable, so a refused
-     * connection under on=5xx opens the circuit and a validation error never does.
+     * connection under on=5xx opens the circuit and a validation error does not, unless the
+     * policy retries it.
      *
      * The verdict never changes the scheduler's decision for an attempt (retry or not, the
      * delay, its give-up reason). Through the breaker it changes whether the run goes on: a
