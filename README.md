@@ -27,6 +27,13 @@ Requires PHP 8.2 or later. Version 2 changes behaviour: see [CHANGELOG.md](CHANG
 composer require gohany/rtry
 ```
 
+Upgrading to 2.5 from an older 2.x: 2.5 requires gohany/retry 2.0.1, and with 2.0.0 in your
+lock file `composer update gohany/rtry` alone changes nothing (and exits 0). Update both:
+
+```bash
+composer update gohany/rtry gohany/retry
+```
+
 ## Quick start
 
 ```php
@@ -181,9 +188,11 @@ error:
   23, 42, 44, 45 (MySQL's `SIGNAL`) or P0 (PostgreSQL's `RAISE`), or 40001 and 40P01
   (serialization failure, deadlock);
 - or a MySQL server error number (1000 to 1999, 3000 to 5999), from `errorInfo`, a mysqli
-  code, or PDO's `General error: 1366` and `[1049]`. MySQL files many value errors under
-  `HY000`, so the SQLSTATE cannot tell: 1366, 1525, 1411, 1298, and the connect errors 1049
-  (`Unknown database 'tenant_...'`) and 1045. Not the connection numbers 1040 and 1053, nor
+  code, PDO's `General error: 1366` and `[1049]`, or the int code of a `PDOException` built
+  from a driver's error (`new PDOException($mysqli->error, $mysqli->errno)`), whose whole
+  message is then the server's text, as a `mysqli_sql_exception`'s is. MySQL files many value
+  errors under `HY000`, so the SQLSTATE cannot tell: 1366, 1525, 1411, 1298, and the connect
+  errors 1049 (`Unknown database 'tenant_...'`) and 1045. Not the connection numbers 1040 and 1053, nor
   4031 with MySQL's idle-disconnect text (below), Oracle's ORA numbers (PDO_OCI files them
   under `HY000`), or the numbers whose text is not the server's answer, which are read as
   before whatever their SQLSTATE: 1105, 1815, 1317, 1203 and 1041, which Vitess, TiDB and

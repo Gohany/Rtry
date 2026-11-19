@@ -3,13 +3,17 @@
 ## 2.5.0 — 2026-11-19
 
 Fixes from the re-verification of PR #9 at 2.4.1 (two should-fixes and five nits) and from the
-hostile review of PR #10 (a tag blocker, a should-fix and five nits), breaker keys out of
-exception messages, and a bound on the spread above a server's `Retry-After`. A minor release:
-public API is added (`CircuitStateContendedException`, two optional arguments on
-`RtryScheduler::headerSpreadMs()`, `RtryAttemptOutcome::roomAboveServerTimeMs()`, two
-constants), none removed, and the spread above a server's wait changes the sleeps of every
-policy whose jitter window is over the bound (under Changed). Requires gohany/retry 2.0.1. The
-other changes bring 2.4.0's behaviour back where 2.4.1 moved it unintentionally.
+hostile review of PR #10 (a tag blocker, a should-fix and five nits) and of PR #11 (a
+should-fix and five nits), breaker keys out of exception messages, and a bound on the spread
+above a server's `Retry-After`. A minor release: public API is added
+(`CircuitStateContendedException`, two optional arguments on `RtryScheduler::headerSpreadMs()`,
+two constants), none removed, and the spread above a server's wait changes the sleeps of every
+policy whose jitter window is over the bound (under Changed). The other changes bring 2.4.0's
+behaviour back where 2.4.1 moved it unintentionally.
+
+Requires gohany/retry 2.0.1. **Update both packages together**: with gohany/retry 2.0.0 in your
+lock file, `composer update gohany/rtry` alone finds nothing to change, exits 0 and leaves you
+on 2.4.1. Run `composer update gohany/rtry gohany/retry` (or `composer update gohany/rtry -W`).
 
 ### Fixed
 
@@ -18,12 +22,31 @@ other changes bring 2.4.0's behaviour back where 2.4.1 moved it unintentionally.
   was `Circuit open for <key>`: keys can carry tenant ids, and a key's words (`db.replica
   connection refused pool`) were read as an outage by an outer guard. gohany/retry 2.0.1's
   message is `Circuit open` with the key in `key()`; composer.json now requires `^2.0.1`, so
-  updating Rtry alone cannot leave 2.0.0 in place.
+  no install pairs this release with 2.0.0. Composer will not move gohany/retry for you,
+  though: update both (above).
 - **A `PDOException` built from a driver's error is read as the driver's error.** `new
   PDOException($mysqli->error, $mysqli->errno)` has no `errorInfo` and no PDO prefix, so its
   number had no text: MySQL's 4031 idle disconnect was taken for an answer and did not count.
-  When a `PDOException` has an int code and neither, its whole message is the server's text,
-  as a `mysqli_sql_exception`'s is (so a lock wait timeout built this way is also read as one).
+  When a `PDOException` has a non-zero int code and neither, its whole message is the server's
+  text, as a `mysqli_sql_exception`'s is (a string code, code 0 or any other exception keeps
+  its message unread). This moves every number whose text is matched, in both directions, each
+  to what the same error already did as a `mysqli_sql_exception` or from PDO's own fields.
+  Against 2.4.1, for this shape: 1614, 3058 and 3132 gain `DEADLOCK` and are retried under
+  `on=default`; 1639, 3699 (a regular expression timeout), 3781 and 3840 gain `ETIMEDOUT`, are
+  retried and count toward the breaker; 3133 gains `ETIMEDOUT` and `DEADLOCK` and is retried,
+  and 1205 gains `ETIMEDOUT` (as lock wait timeouts, neither counts under `on=5xx`); 4031 with
+  MySQL's idle-disconnect text counts. Outside MySQL's own numbers: ProxySQL's 1907
+  `query_timeout` text and SingleStore's 1735 leaf text are retried and count; PostgreSQL's
+  `canceling statement due to lock timeout` under an int code is a lock timeout and no longer
+  counts; a message that starts with PDO_OCI's call (`OCIStmtExecute: ORA-01205: ...`) is
+  Oracle's, so it loses the `DEADLOCK` MySQL's 1205 gave it.
+- **Only PDO_OCI's call name makes a database error Oracle's.** A driver text or PDO
+  description starting with `oci` in any case dropped the error's number as Oracle's; read on a
+  whole hand-built message (above), `new PDOException("Ocient loader: Duplicate entry
+  'connection refused' for key 'u'", 1062)` lost its 1062, so its words were read, and it was
+  retried and opened the circuit. Oracle's is now the OCI call's name and a colon, as PDO_OCI
+  writes it (`OCIStmtExecute: ...`, `OCISessionBegin: ...`); the same text as a
+  `mysqli_sql_exception` or in `errorInfo` moves the same way.
 
 - **MariaDB's 4031 no longer opens the circuit.** 2.4.1 counted 4031 by number alone as
   MySQL's idle disconnect. On MariaDB 4031 is a DDL answer (`Referenced trigger '...' for the
@@ -79,9 +102,9 @@ other changes bring 2.4.0's behaviour back where 2.4.1 moved it unintentionally.
   part of the bound, so the draw is scaled into it: the busiest millisecond holds 22 and 38.
   Whether a wait fits `dl` is still decided by the server's time, so no caller gains or loses
   an attempt, and a room at least as wide as the bound changes nothing, draw for draw.
-  `headerSpreadMs()` takes the room as a fifth optional argument and
-  `RtryAttemptOutcome::roomAboveServerTimeMs()` computes it; `Retry`, `outcome()` and
-  `fromError()` pass it.
+  `headerSpreadMs()` takes the room as a fifth optional argument; `Retry`, `outcome()` and
+  `fromError()` pass it, computed by `RtryAttemptOutcome::roomAboveServerTimeMs()` (marked
+  `@internal`: public for them, not part of the API).
 
 ### Docs
 
