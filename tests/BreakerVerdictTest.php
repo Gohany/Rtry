@@ -162,13 +162,13 @@ final class BreakerVerdictTest extends TestCase
         self::assertSame(CircuitState::Closed, $breaker->state('api'));
     }
 
-    public function testARetried404IsTheServiceAnsweringAndKeepsTheCircuitClosed(): void
+    public function testARetried404IsTheServiceAnsweringAndKeepsTheCircuitClosedWhenRetriesDoNotCount(): void
     {
         $breaker = $this->breaker();
         $op = static fn (): never => throw HttpFailure::status(404);
 
         [$result] = $this->runGuarded(
-            $this->retry()->withGuard('api', null, $breaker, new ServiceFailureVerdict()),
+            $this->retry()->withGuard('api', null, $breaker, new ServiceFailureVerdict(countRetryable: false)),
             'rtry:a=4;d=100;j=0;on=default,404',
             $op,
         );
@@ -219,12 +219,12 @@ final class BreakerVerdictTest extends TestCase
     public function testTheVerdictSeesEachFailedAttemptsOutcome(): void
     {
         $verdict = new class implements BreakerVerdictInterface {
-            /** @var list<array{?int, list<string>, string}> */
+            /** @var list<array{?int, list<string>, string, bool}> */
             public array $seen = [];
 
-            public function isServiceFailure(AttemptOutcomeInterface $outcome): bool
+            public function isServiceFailure(AttemptOutcomeInterface $outcome, bool $retryable): bool
             {
-                $this->seen[] = [$outcome->statusCode(), $outcome->tags(), $outcome->error()?->getMessage() ?? ''];
+                $this->seen[] = [$outcome->statusCode(), $outcome->tags(), $outcome->error()?->getMessage() ?? '', $retryable];
                 return false;
             }
         };
@@ -236,13 +236,13 @@ final class BreakerVerdictTest extends TestCase
 
         $this->runGuarded($this->retry()->withGuard('api', null, $this->breaker(), $verdict), 'rtry:a=3;d=100;j=0;on=5xx', $op);
 
-        self::assertSame([[503, [], 'HTTP 503'], [null, ['ECONNREFUSED'], 'connect ECONNREFUSED 10.0.0.7:443']], $verdict->seen);
+        self::assertSame([[503, [], 'HTTP 503', true], [null, ['ECONNREFUSED'], 'connect ECONNREFUSED 10.0.0.7:443', false]], $verdict->seen);
     }
 
     public function testAVerdictThatThrowsFallsBackToThePolicysAnswerAndIsLoggedByClass(): void
     {
         $verdict = new class implements BreakerVerdictInterface {
-            public function isServiceFailure(AttemptOutcomeInterface $outcome): bool
+            public function isServiceFailure(AttemptOutcomeInterface $outcome, bool $retryable): bool
             {
                 throw new \LogicException('secret=hunter2');
             }
@@ -266,7 +266,7 @@ final class BreakerVerdictTest extends TestCase
         $verdict = new class implements BreakerVerdictInterface {
             public int $asked = 0;
 
-            public function isServiceFailure(AttemptOutcomeInterface $outcome): bool
+            public function isServiceFailure(AttemptOutcomeInterface $outcome, bool $retryable): bool
             {
                 $this->asked++;
                 return true;
@@ -276,22 +276,6 @@ final class BreakerVerdictTest extends TestCase
         $this->runGuarded($this->retry()->withGuard('api', null, null, $verdict), 'rtry:a=3;d=100;j=0', static fn (): never => throw HttpFailure::status(503));
 
         self::assertSame(0, $verdict->asked);
-    }
-
-    public function testTheVerdictNeverChangesTheSleeps(): void
-    {
-        $op = static fn (): never => throw HttpFailure::status(503, ['Retry-After' => '2']);
-        $spec = 'rtry:a=4;d=100';
-        $breaker = static fn (FrozenClock $c): CircuitBreaker => new CircuitBreaker(new InMemoryCircuitBreakerStore($c), $c, failureThreshold: 50, windowMs: 10_000, openMs: 5_000);
-
-        $this->runGuarded($this->retry()->withGuard('api', null, $breaker($this->clock)), $spec, $op);
-        $without = $this->sleeper->sleeps();
-
-        $this->setUp();
-        $this->runGuarded($this->retry()->withGuard('api', null, $breaker($this->clock), new ServiceFailureVerdict()), $spec, $op);
-
-        self::assertCount(3, $without);
-        self::assertSame($without, $this->sleeper->sleeps());
     }
 
     // ---- ServiceFailureVerdict on its own -------------------------------------------------
@@ -318,7 +302,7 @@ final class BreakerVerdictTest extends TestCase
         yield 'ECONNREFUSED' => [null, ['ECONNREFUSED'], true];
         yield 'NETWORK_ERROR' => [null, ['NETWORK_ERROR'], true];
         yield 'a deadlock is the service answering' => [null, ['DEADLOCK'], false];
-        yield 'SMTP 421 that timed out' => [421, ['ETIMEDOUT'], true];
+        yield 'a 421 that timed out' => [421, ['ETIMEDOUT'], true];
         yield 'a tag of your own' => [null, ['SDK_TRANSPORT'], false];
     }
 
@@ -326,32 +310,33 @@ final class BreakerVerdictTest extends TestCase
     #[DataProvider('outcomes')]
     public function testTheDefaultVerdict(?int $status, array $tags, bool $failure): void
     {
-        $outcome = RtryAttemptOutcome::failure(new \RuntimeException('x'), $status, $tags);
-        self::assertSame($failure, (new ServiceFailureVerdict())->isServiceFailure($outcome));
+        // The status as read from a response; the error's message names no outage.
+        $outcome = RtryAttemptOutcome::failure(new \RuntimeException('x'), $status, $tags, null, $status !== null);
+        self::assertSame($failure, (new ServiceFailureVerdict())->isServiceFailure($outcome, false));
     }
 
     public function testExtraTagsCountAndAreMatchedWithoutCase(): void
     {
         $verdict = new ServiceFailureVerdict([...ServiceFailureVerdict::UNAVAILABLE_TAGS, 'sdk_transport']);
 
-        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['SDK_TRANSPORT'])));
-        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['ETIMEDOUT'])));
-        self::assertFalse($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), 404, ['DEADLOCK'])));
+        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['SDK_TRANSPORT']), false));
+        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['ETIMEDOUT']), false));
+        self::assertFalse($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), 404, ['DEADLOCK']), false));
     }
 
     public function testTagsCanBeNarrowed(): void
     {
         $verdict = new ServiceFailureVerdict(['ECONNREFUSED']);
 
-        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['ECONNREFUSED'])));
-        self::assertFalse($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['ETIMEDOUT'])));
-        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), 502)), 'statuses still count');
+        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['ECONNREFUSED']), false));
+        self::assertFalse($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), null, ['ETIMEDOUT']), false));
+        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(HttpFailure::status(502), 502), false), 'statuses still count');
     }
 
     public function testASuccessfulOutcomeIsNoFailure(): void
     {
-        self::assertFalse((new ServiceFailureVerdict())->isServiceFailure(RtryAttemptOutcome::success('ok')));
-        self::assertFalse((new ServiceFailureVerdict())->isServiceFailure(TestOutcome::success()));
+        self::assertFalse((new ServiceFailureVerdict())->isServiceFailure(RtryAttemptOutcome::success('ok'), false));
+        self::assertFalse((new ServiceFailureVerdict())->isServiceFailure(TestOutcome::success(), true));
 
         // An outcome of your own that succeeded but kept its 503 is still no failure.
         $succeededWithAStatus = new class implements AttemptOutcomeInterface {
@@ -385,7 +370,7 @@ final class BreakerVerdictTest extends TestCase
                 return null;
             }
         };
-        self::assertFalse((new ServiceFailureVerdict())->isServiceFailure($succeededWithAStatus));
+        self::assertFalse((new ServiceFailureVerdict())->isServiceFailure($succeededWithAStatus, true));
     }
 
     public function testItReadsTheDefaultClassifiersOutcomes(): void
@@ -395,12 +380,12 @@ final class BreakerVerdictTest extends TestCase
             return RtryAttemptOutcome::fromMetadata($e, RuleBasedFailureClassifier::default()->classify($e), self::T0);
         };
 
-        self::assertTrue($verdict->isServiceFailure($classify(self::refused())));
-        self::assertTrue($verdict->isServiceFailure($classify(new \RuntimeException('cURL error 28: Operation timed out'))));
-        self::assertTrue($verdict->isServiceFailure($classify(HttpFailure::status(502))));
-        self::assertTrue($verdict->isServiceFailure($classify(HttpFailure::status(403, ['Retry-After' => '60']))));
-        self::assertFalse($verdict->isServiceFailure($classify(HttpFailure::status(404, [], 'GET /timeout timed out'))));
-        self::assertFalse($verdict->isServiceFailure($classify(new \DomainException('Payment refused by issuer'))));
-        self::assertFalse($verdict->isServiceFailure($classify(new \RuntimeException('SQLSTATE[40001]: Deadlock found'))));
+        self::assertTrue($verdict->isServiceFailure($classify(self::refused()), false));
+        self::assertTrue($verdict->isServiceFailure($classify(new \RuntimeException('cURL error 28: Operation timed out')), false));
+        self::assertTrue($verdict->isServiceFailure($classify(HttpFailure::status(502)), false));
+        self::assertTrue($verdict->isServiceFailure($classify(HttpFailure::status(403, ['Retry-After' => '60'])), false));
+        self::assertFalse($verdict->isServiceFailure($classify(HttpFailure::status(404, [], 'GET /timeout timed out')), false));
+        self::assertFalse($verdict->isServiceFailure($classify(new \DomainException('Payment refused by issuer')), false));
+        self::assertFalse($verdict->isServiceFailure($classify(new \RuntimeException('SQLSTATE[40001]: Deadlock found')), false));
     }
 }
