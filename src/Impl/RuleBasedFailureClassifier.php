@@ -25,11 +25,13 @@ use Gohany\Rtry\Impl\Rules\ResponseStatusRule;
  *   number, deadlock SQLSTATEs and vendor codes, errno names (ECONNREFUSED, ETIMEDOUT,
  *   ECONNRESET), and specific phrases ("connection refused", "timed out", "deadlock found",
  *   driver timeouts such as PostgreSQL's "canceling statement due to statement timeout"),
- *   never a bare word such as "timeout" or "refused". A
- *   LogicException or an \Error (TypeError, ValueError) is a bug or a validation error: its
- *   message is never read for tags. Nor is the message of a database error whose SQLSTATE says
- *   the database answered about the values it was sent (DatabaseAnswer: class 21, 22, 23, 42, 44,
- *   45 or P0), since such a message echoes them: "Duplicate entry 'timed out'" runs once.
+ *   never a bare word such as "timeout" or "refused". A LogicException or an \Error
+ *   (TypeError, ValueError) is a bug or a validation error: its message is never read, for tags
+ *   or for a SQLSTATE. Nor is the message of a database's answer about the values it was sent,
+ *   or of an error wrapping one that quotes it (DatabaseAnswer: an answering SQLSTATE class, or
+ *   a MySQL server error number such as 1366), since such a message echoes them: "Duplicate
+ *   entry 'timed out'" and "Incorrect integer value: 'timed out'" run once. Deadlocks and lock
+ *   timeouts get their tags from their SQLSTATE, number and the server's own text instead.
  * - Tags from rules you add are kept whatever the status.
  */
 final class RuleBasedFailureClassifier implements FailureClassifierInterface, RuleBasedClassifierInterface
@@ -263,20 +265,27 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
     private function collectTags(\Throwable $e): array
     {
         $tags = [];
+        $unread = DatabaseAnswer::unread($e, self::MAX_DEPTH);
         for ($t = $e, $depth = 0; $t !== null && $depth < self::MAX_DEPTH; $t = $t->getPrevious(), $depth++) {
             foreach (self::TRANSPORT_TYPES as $type) {
                 if ($t instanceof $type) {
                     $tags[] = FailureToken::NETWORK_ERROR;
                 }
             }
-            if ($this->isDeadlockType($t)) {
+            if (
+                class_exists(\Doctrine\DBAL\Exception\DeadlockException::class)
+                && $t instanceof \Doctrine\DBAL\Exception\DeadlockException
+            ) {
                 $tags[] = FailureToken::DEADLOCK;
             }
+            // Deadlocks and lock timeouts by SQLSTATE, number and the server's own text.
+            $tags = array_merge($tags, DatabaseAnswer::tags($t));
 
             // A LogicException or an \Error is a bug or a validation error, whatever it says; a
-            // database error whose SQLSTATE says it answered (a duplicate key, bad data) echoes
-            // the values it was sent, so its words are not the caller's to choose tags with.
-            if ($t instanceof \LogicException || $t instanceof \Error || DatabaseAnswer::is($t)) {
+            // database's answer (a duplicate key, a value MySQL could not take) echoes the values
+            // it was sent, and so does an error wrapping one that quotes it, so their words are
+            // not the caller's to choose tags with. Other errors, above or below, are read.
+            if ($t instanceof \LogicException || $t instanceof \Error || isset($unread[$depth])) {
                 continue;
             }
             $message = strtolower((string) $t->getMessage());
@@ -306,80 +315,6 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
         }
 
         return array_values(array_unique($tags));
-    }
-
-    private function isDeadlockType(\Throwable $t): bool
-    {
-        if (
-            class_exists(\Doctrine\DBAL\Exception\DeadlockException::class)
-            && $t instanceof \Doctrine\DBAL\Exception\DeadlockException
-        ) {
-            return true;
-        }
-
-        // PDOException: inspect SQLSTATE and vendor codes
-        if ($t instanceof \PDOException) {
-            $sqlState = $this->extractSqlState($t);
-            if ($sqlState !== null && $this->isDeadlockSqlState($sqlState)) {
-                return true;
-            }
-
-            $vendorCode = $this->extractVendorCode($t);
-            if ($vendorCode !== null && $this->isDeadlockVendorCode($vendorCode)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private function extractSqlState(\PDOException $e): ?string
-    {
-        $errorInfo = $e->errorInfo ?? null;
-        if (is_array($errorInfo) && isset($errorInfo[0]) && is_string($errorInfo[0]) && $errorInfo[0] !== '') {
-            return strtoupper($errorInfo[0]);
-        }
-
-        $code = $e->getCode();
-        if (is_string($code) && $code !== '') {
-            return strtoupper($code);
-        }
-
-        return null;
-    }
-
-    private function isDeadlockSqlState(string $sqlState): bool
-    {
-        // Common SQLSTATEs for deadlocks/serialization failures
-        // 40001: Serialization failure (PostgreSQL, SQL standard)
-        // 40P01: Deadlock detected (PostgreSQL)
-        return in_array($sqlState, ['40001', '40P01'], true);
-    }
-
-    private function extractVendorCode(\PDOException $e): ?int
-    {
-        $errorInfo = $e->errorInfo ?? null;
-        if (is_array($errorInfo) && isset($errorInfo[1])) {
-            $vendor = $errorInfo[1];
-
-            if (is_int($vendor)) {
-                return $vendor;
-            }
-
-            if (is_string($vendor) && ctype_digit($vendor)) {
-                return (int) $vendor;
-            }
-        }
-
-        return null;
-    }
-
-    private function isDeadlockVendorCode(int $vendorCode): bool
-    {
-        // MySQL / MariaDB / MSSQL common vendor codes:
-        // 1213: ER_LOCK_DEADLOCK (MySQL)
-        // 1205: Lock wait timeout exceeded / deadlock victim (MySQL/MSSQL)
-        return in_array($vendorCode, [1213, 1205], true);
     }
 
     /**

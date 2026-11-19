@@ -5,6 +5,7 @@ namespace Gohany\Rtry\Impl\Breaker;
 use Gohany\Retry\AttemptOutcomeInterface;
 use Gohany\Rtry\Contracts\BreakerVerdictInterface;
 use Gohany\Rtry\Contracts\ErrorResponseReaderInterface;
+use Gohany\Rtry\Impl\DatabaseAnswer;
 use Gohany\Rtry\Impl\ErrorResponseLocator;
 use Gohany\Rtry\Impl\FailureToken;
 use Gohany\Rtry\Impl\RtryAttemptOutcome;
@@ -28,10 +29,11 @@ use Gohany\Rtry\Impl\RtryAttemptOutcome;
  *   a database driver's connection error number.
  *
  * Anything else is a success: a 404 or a 422 (the service answered), a DEADLOCK or a lock wait
- * timeout (the database answered: contention, not an outage; the ETIMEDOUT a lock timeout's
- * words also give does not count beside DEADLOCK), a database error whose SQLSTATE says it
- * answered about the values it was sent (a duplicate key: its message echoes them and is not
- * read), a validation error, an error with nothing to go on.
+ * timeout (the database answered: contention, not an outage; the ETIMEDOUT a lock timeout also
+ * gets does not count when the error is one: MySQL 1205 or PostgreSQL 55P03), a database's
+ * answer about the values it was sent (DatabaseAnswer: a duplicate key, MySQL's "Incorrect
+ * integer value": its message echoes them and is not read), a validation error, an error with
+ * nothing to go on.
  *
  * Where the status came from: an outcome whose statusFromResponse() is true read it from a
  * response, and it is trusted. For any other outcome (false says only that the status is not the
@@ -55,6 +57,8 @@ final class ServiceFailureVerdict implements BreakerVerdictInterface
         FailureToken::NETWORK_ERROR,
         FailureToken::RATE_LIMITED,
     ];
+
+    private const MAX_DEPTH = 16;
 
     /** @var array<string, true> upper-cased */
     private readonly array $unavailableTags;
@@ -95,8 +99,11 @@ final class ServiceFailureVerdict implements BreakerVerdictInterface
         foreach ($outcome->tags() as $tag) {
             $tags[strtoupper((string) $tag)] = true;
         }
-        if (isset($tags[FailureToken::DEADLOCK])) {
+        $error = $outcome->error();
+        if (isset($tags[FailureToken::DEADLOCK]) && $error !== null && DatabaseAnswer::isLockTimeout($error, self::MAX_DEPTH)) {
             // A lock wait timeout: the database answered, whatever its words say about time.
+            // Only then: a DEADLOCK from the bare word "deadlock" beside a real timeout
+            // ("Read timed out ... for sku 'deadlock'") leaves the timeout counting.
             unset($tags[FailureToken::ETIMEDOUT]);
         }
         foreach ($tags as $tag => $_) {
@@ -104,7 +111,6 @@ final class ServiceFailureVerdict implements BreakerVerdictInterface
                 return true;
             }
         }
-        $error = $outcome->error();
         return $status === null && $error !== null && UnavailableEvidence::in($error);
     }
 

@@ -1,0 +1,32 @@
+# ProxySQL 2.7 in front of the MySQL that RealMysqlTest uses (host rtry-mysql, root/root), for
+# RealProxySqlTest. Hostgroup 1 is an address nothing answers on, so user "down" gets 9001.
+datadir="/var/lib/proxysql"
+
+admin_variables=
+{
+    admin_credentials="admin:admin;radmin:radmin"
+    mysql_ifaces="0.0.0.0:6032"
+}
+
+mysql_variables=
+{
+    threads=2
+    interfaces="0.0.0.0:6033"
+    server_version="8.0.43"
+    monitor_enabled=false
+    default_query_timeout=1500
+    connect_timeout_server=500
+    connect_timeout_server_max=2000
+}
+
+mysql_servers=
+(
+    { address="rtry-mysql", port=3306, hostgroup=0 },
+    { address="10.255.255.1", port=3306, hostgroup=1 }
+)
+
+mysql_users=
+(
+    { username="root", password="root", default_hostgroup=0 },
+    { username="down", password="down", default_hostgroup=1 }
+)
