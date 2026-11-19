@@ -12,10 +12,13 @@ use Gohany\Rtry\Impl\DatabaseAnswer;
  * lost database connections, phpredis read errors, broken pipes, certificate failures) count.
  *
  * Never from an exception code alone: a code counts only on a database driver's own exception
- * (PDOException, mysqli_sql_exception), as its connection error number. The message of a
- * LogicException or an \Error (a bug or a validation error) is never read; its previous
- * errors still are. Nor is the message of a database error whose SQLSTATE says the database
- * answered (DatabaseAnswer): "Duplicate entry 'broken pipe'" echoes what the caller sent.
+ * (PDOException, mysqli_sql_exception), as its connection error number; a SQLSTATE counts from
+ * a database error's own fields (errorInfo, a string code, getSqlState()) or a message. The
+ * message of a LogicException or an \Error (a bug or a validation error) is never read; its
+ * previous errors still are. Nor is the message of a database's answer (DatabaseAnswer: a
+ * duplicate key, a value MySQL could not take) or of any error wrapping one: "Duplicate entry
+ * 'broken pipe'" and "Incorrect integer value: 'broken pipe'" echo what the caller sent.
+ * Evidence from types, SQLSTATEs and driver numbers counts at any depth, answer or not.
  *
  * @internal
  */
@@ -33,20 +36,18 @@ final class UnavailableEvidence
         'Predis\\Connection\\ConnectionException',
     ];
 
-    private const DRIVER_TYPES = ['PDOException', 'mysqli_sql_exception'];
-
     /**
      * MySQL / MariaDB: 1040 too many connections, 1053 server shutdown in progress, 2002 and
      * 2003 cannot connect, 2005 unknown host, 2006 server has gone away, 2013 and 2055 lost
      * connection.
      */
-    private const MYSQL_CODES = [1040, 1053, 2002, 2003, 2005, 2006, 2013, 2055];
+    public const MYSQL_CODES = [1040, 1053, 2002, 2003, 2005, 2006, 2013, 2055];
 
     /**
      * SQLSTATE class 08 (connection exception), 57P01-57P03 (PostgreSQL shutting down or not
      * yet accepting connections), 53300 (too many connections).
      */
-    private const SQLSTATE_PATTERN = '~^(08[0-9A-Z]{3}|57P0[123]|53300)$~';
+    public const SQLSTATE_PATTERN = '~^(08[0-9A-Z]{3}|57P0[123]|53300)$~';
 
     /** cURL errors that mean no answer: proxy and host DNS, connect, timeout, TLS, empty reply, send, receive, certificate. */
     private const CURL_ERRORS = [5, 6, 7, 28, 35, 52, 55, 56, 60];
@@ -75,27 +76,27 @@ final class UnavailableEvidence
 
     public static function in(\Throwable $e): bool
     {
+        $unread = DatabaseAnswer::unreadDepth($e, self::MAX_DEPTH);
         for ($t = $e, $depth = 0; $t !== null && $depth < self::MAX_DEPTH; $t = $t->getPrevious(), $depth++) {
-            if (self::one($t)) {
+            if (self::one($t, $depth >= $unread)) {
                 return true;
             }
         }
         return false;
     }
 
-    private static function one(\Throwable $t): bool
+    /** @param bool $readWords false for a database's answer and the errors that wrap it */
+    private static function one(\Throwable $t, bool $readWords): bool
     {
         foreach (self::TYPES as $type) {
             if ($t instanceof $type) {
                 return true;
             }
         }
-        foreach (self::DRIVER_TYPES as $type) {
-            if ($t instanceof $type && self::isDriverConnectionError($t)) {
-                return true;
-            }
+        if (DatabaseAnswer::isConnectionError($t)) {
+            return true;
         }
-        if ($t instanceof \LogicException || $t instanceof \Error || DatabaseAnswer::is($t)) {
+        if (!$readWords || $t instanceof \LogicException || $t instanceof \Error) {
             return false;
         }
 
@@ -128,23 +129,5 @@ final class UnavailableEvidence
             }
         }
         return false;
-    }
-
-    private static function isDriverConnectionError(\Throwable $t): bool
-    {
-        $info = $t instanceof \PDOException ? $t->errorInfo : null;
-        if (is_array($info)) {
-            if (isset($info[0]) && is_string($info[0]) && preg_match(self::SQLSTATE_PATTERN, strtoupper($info[0]))) {
-                return true;
-            }
-            if (isset($info[1]) && is_numeric($info[1]) && in_array((int) $info[1], self::MYSQL_CODES, true)) {
-                return true;
-            }
-        }
-        $code = $t->getCode();
-        if (is_int($code)) {
-            return in_array($code, self::MYSQL_CODES, true);
-        }
-        return is_string($code) && preg_match(self::SQLSTATE_PATTERN, strtoupper($code)) === 1;
     }
 }
