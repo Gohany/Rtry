@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.5.1 (Unreleased)
+
+Tests and documentation from the re-verification of PR #12 (three nits). No code changes:
+every error reads, retries and counts as on 2.5.0.
+
+### Tests
+
+- **The OCI-call rule is pinned edge by edge.** Five of fourteen mutants of the rule that makes
+  an error Oracle's (`DatabaseAnswer::OCI_CALL`) left the suite green. Without the `^` anchor,
+  `Duplicate entry 'OCIStmtExecute: connection refused' for key 'u'` (1062, hand-built or
+  mysqli) was read as Oracle's, its words were read, and it was retried and opened the circuit.
+  Each mutant now fails a test: the name in a value, after a newline in a value, after leading
+  whitespace, with a digit (`OCI8: `, not Oracle's) and with an underscore (PDO_OCI's own
+  `OCI_NEED_DATA: OCI_NEED_DATA (...)`, which under 1205 is not a lock wait timeout).
+- **Oracle errors outside the OCI-call rule are pinned as they read.** See Docs.
+
+### Docs
+
+- **README, "Database errors": Oracle errors that do not start with an OCI call's name keep
+  MySQL's reading of their number**, as on 2.4.1 and 2.5.0: PDO_OCI's failed attach
+  (`pdo_oci_handle_factory: ORA-...`) and yajra/pdo-via-oci8's `Oci8Exception` (its code the
+  ORA number): ORA-01205 and ORA-01213 are retried as deadlocks. Through PDO_OCI, ORA-01040 and
+  ORA-01053 count as MySQL's connection numbers 1040 and 1053, as on 2.4.0.
+- **2.5.0's entry for the hand-built `PDOException` no longer lists MySQL's 4031 as moved.** A
+  hand-built 4031 with MySQL's idle-disconnect text already counted on 2.4.1, by number alone;
+  what moved at 4031 for that shape is MariaDB's text, which has its own entry.
+
 ## 2.5.0 — 2026-11-19
 
 Fixes from the re-verification of PR #9 at 2.4.1 (two should-fixes and five nits) and from the
@@ -35,7 +62,8 @@ on 2.4.1. Run `composer update gohany/rtry gohany/retry` (or `composer update go
   `on=default`; 1639, 3699 (a regular expression timeout), 3781 and 3840 gain `ETIMEDOUT`, are
   retried and count toward the breaker; 3133 gains `ETIMEDOUT` and `DEADLOCK` and is retried,
   and 1205 gains `ETIMEDOUT` (as lock wait timeouts, neither counts under `on=5xx`); 4031 with
-  MySQL's idle-disconnect text counts. Outside MySQL's own numbers: ProxySQL's 1907
+  MySQL's idle-disconnect text counts, as it did on 2.4.1 by number alone (what moves at 4031
+  is MariaDB's text, below). Outside MySQL's own numbers: ProxySQL's 1907
   `query_timeout` text and SingleStore's 1735 leaf text are retried and count; PostgreSQL's
   `canceling statement due to lock timeout` under an int code is a lock timeout and no longer
   counts; a message that starts with PDO_OCI's call (`OCIStmtExecute: ORA-01205: ...`) is
