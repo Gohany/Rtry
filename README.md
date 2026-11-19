@@ -100,8 +100,9 @@ Rtry turns a thrown error into a status and tags with a `RuleBasedFailureClassif
   Doctrine's `DeadlockException`, "Deadlock found", PostgreSQL's lock timeout). A bare
   "timeout" or "refused" is not evidence: "timeout must be a positive integer" and "Payment
   refused by issuer" run once. A `LogicException` or an `\Error` (`TypeError`, `ValueError`)
-  never gets tags from its message: it is a bug or a validation error. Nor does a database's
-  answer about the values it was sent, or an error wrapping one (see "Database errors" below):
+  never gets tags from its message, nor a SQLSTATE: it is a bug or a validation error. Nor
+  does a database's answer about the values it was sent, or an error wrapping one that quotes
+  it (see "Database errors" below):
   `Duplicate entry 'timed out' for key 'name'` and `Incorrect integer value: 'timed out'` echo
   a submitted value and run once.
 - `Retry-After` on any response, and `RateLimit-Reset(-After)` and
@@ -164,11 +165,16 @@ return `new ErrorResponse($e->getCode())` for its exception class.
 A database error that is the database answering about what it was sent (a duplicate key, a
 value it could not take) echoes that value: MySQL's `Duplicate entry 'timed out' for key
 'name'`, `Incorrect integer value: 'connection refused' for column 'qty'`. Rtry never reads such
-an error's message for transport words, nor the message of an error wrapping it (Laravel's
-`QueryException` with the bindings it appends, a Doctrine DBAL wrapper, your own
-`RuntimeException('Saving failed: ...', 0, $e)`): it runs once and the breaker's verdict counts
-it as a success. It is recognised by what the database error carries, never by a message's
-words:
+an error's message for transport words, nor the message of an error wrapping it that quotes
+it, its message or the driver's text in any case (Laravel's `QueryException` with the bindings
+it appends, a Doctrine DBAL wrapper, your own `RuntimeException('Saving failed: ' .
+$e->getMessage(), 0, $e)`): it runs once and the breaker's verdict counts it as a success. An
+error above it that does not quote it is read, since its words are its own: a cache's `read
+error on connection` thrown in a `finally` while a duplicate key unwinds, a cURL timeout with
+the duplicate as its previous. A database error is recognised by what it carries, never by a
+message's words, and never from the message of a `LogicException` or an `\Error`:
+`InvalidArgumentException('SQLSTATE[08006] is not a valid coupon code')` is a validation
+error:
 
 - its SQLSTATE, from a `PDOException`'s `errorInfo` or code, `getSqlState()` (mysqli, Doctrine
   DBAL) or `SQLSTATE[...]` at the very start of a message, where PDO writes it: class 21, 22,
@@ -177,14 +183,21 @@ words:
 - or a MySQL server error number (1000 to 1999, 3000 to 5999), from `errorInfo`, a mysqli
   code, or PDO's `General error: 1366` and `[1049]`. MySQL files many value errors under
   `HY000`, so the SQLSTATE cannot tell: 1366, 1525, 1411, 1298, and the connect errors 1049
-  (`Unknown database 'tenant_...'`) and 1045. Not 1105 (Vitess, TiDB and proxies use it for
-  anything, outages included), 1429 and 1430 (FEDERATED relaying its foreign source), the
-  connection numbers 1040 and 1053, or Oracle's ORA numbers (PDO_OCI files them under `HY000`).
+  (`Unknown database 'tenant_...'`) and 1045. Not the connection numbers 1040, 1053 and 4031,
+  Oracle's ORA numbers (PDO_OCI files them under `HY000`), or the numbers whose text is not
+  the server's answer, which are read as before whatever their SQLSTATE: 1105, 1815, 1317, 1203
+  and 1041, which Vitess, TiDB and proxies send with their own text, outages included (Vitess
+  sends a deadline or a cancel as 1317, an internal error as 1815); 1296, 1297, 1429 and 1430,
+  an engine (FEDERATED, NDB) relaying another server's error; and ProxySQL's own query timeout,
+  `1907 Query execution was interrupted, query_timeout exceeded` (by number and text: MariaDB's
+  1907 is an answer).
 
 A connection SQLSTATE (class 08, 57P01 to 57P03, 53300), a connection number (2002, 2003,
-2005, 2006, 2013, 2055), any other client error (2000 to 2999), a proxy's own number
-(ProxySQL's 9001 `Max connect timeout reached`) and a transport exception type are read as
-before, and count. A `SQLSTATE[...]` anywhere else in a message is request text (a URL, echoed
+2005, 2006, 2013, 2055, and 4031, MySQL's idle disconnect as PHP 8.5 reports it), any other
+client error (2000 to 2999), a proxy's own number and a transport exception type are read as
+before, and count. Proxies use numbers outside MySQL's range (ProxySQL's 9001 `Max connect
+timeout reached`) and inside it (its 1907, above); every number ProxySQL 2.7 sends of its own
+reads as in 2.4.0. A `SQLSTATE[...]` anywhere else in a message is request text (a URL, echoed
 SQL) and changes nothing: `file_get_contents(http://.../search?q=SQLSTATE[23000]): Failed to
 open stream: Connection refused` is a refused connection.
 
@@ -203,7 +216,26 @@ Not covered, and read as before, so a value in them can still look like an outag
   (`new DatabaseException("Duplicate entry 'broken pipe' ...", 1062)` with no previous): a code
   alone is never taken as a database's number;
 - an error in any other SQLSTATE class that carries its SQL and bindings, such as Laravel's
-  `QueryException` over PostgreSQL's 55P03 or 57014.
+  `QueryException` over PostgreSQL's 55P03 or 57014;
+- an error above a database's answer that echoes the value in its own words without quoting
+  the answer (`"Could not save product 'broken pipe'"`): it is read, as in 2.4.0.
+
+The other way round, some outages or real timeouts are not read as such:
+
+- a message with no database fields is taken to start with what the code that threw wrote, and
+  `SQLSTATE[...]` there is read as PDO's prefix. That is not always so:
+  `"$tenant: could not connect to tenant database: Connection refused"`, with a tenant named
+  `SQLSTATE[23000]` or `SQLSTATE[HY000]: General error: 1366`, is an answer and a success for
+  the breaker;
+- a lock wait timeout by message alone that is not at its start (`Query failed:
+  SQLSTATE[HY000]: General error: 1205 Lock wait timeout exceeded`) counts as an outage, as in
+  2.4.0; the fields of a `PDOException` or a mysqli error, a message that starts with PDO's
+  prefix and DBAL's `LockWaitTimeoutException` are read as a lock timeout;
+- MySQL's 1153 `Got a packet bigger than 'max_allowed_packet' bytes` comes with SQLSTATE
+  `08S01`, and MySQL closes the connection, so it counts as an outage, as in 2.4.0, though a
+  value too large for the server caused it;
+- proxies other than ProxySQL (MaxScale, RDS Proxy) were not checked: an error of their own
+  sent under a MySQL server number is read as the server's answer.
 
 If these matter to you, pass a decider that replaces `on`, or a breaker verdict of your own
 (`Contracts\BreakerVerdictInterface`).
@@ -394,12 +426,13 @@ $results = $retry->try(fn ($attempt) => $client->get($url), (new RtryPolicyFacto
   `RATE_LIMITED`, or one you add;
 - no response was read and the error shows the service could not be reached or could not take
   the call: a DNS failure (`cURL error 6`, `getaddrinfo`, `Could not resolve host`), a refused,
-  reset or lost connection, `MySQL server has gone away`, `[2002]`, too many connections
-  (`[1040]`), a PostgreSQL shutdown, a phpredis `read error on connection`, a broken pipe, or a
+  reset or lost connection, `MySQL server has gone away`, `[2002]`, MySQL's idle disconnect
+  (4031), too many connections (`[1040]`), a PostgreSQL shutdown or `no connection to the
+  server`, a phpredis `read error on connection`, a broken pipe, or a
   certificate failure (`cURL error 60`). It reads transport exception types, cURL error numbers,
   errno names, SQLSTATE class 08 and a database driver's own connection error number. It never
   reads the message of a `LogicException` or an `\Error`, nor of a database's answer about the
-  values it was sent or an error wrapping one ("Database errors", above): MySQL's
+  values it was sent or an error wrapping one that quotes it ("Database errors", above): MySQL's
   `Duplicate entry 'broken pipe'` and `Incorrect integer value: 'broken pipe'` echo what the
   caller submitted.
 

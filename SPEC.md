@@ -17,7 +17,7 @@ Rtry-specific behaviour the SPEC leaves to implementations:
   (100-599) is the status for `on`, and never silences tags. Tags come only from transport and
   deadlock evidence (types, cURL error numbers, errno names, SQLSTATEs, specific phrases
   including driver timeouts), never from a bare word, from a `LogicException`/`\Error`, or from the message of a
-  database's answer or an error wrapping one: a SQLSTATE in class 21, 22, 23, 42, 44, 45, P0 or
+  database's answer or an error wrapping one that quotes it: a SQLSTATE in class 21, 22, 23, 42, 44, 45, P0 or
   40001/40P01, or a MySQL server error number (1000-1999, 3000-5999), read from the database
   error's own fields or from `SQLSTATE[...]` at the start of its message (README, "Database
   errors").
