@@ -169,7 +169,9 @@ final class VerdictSignalsTest extends TestCase
         self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(HttpFailure::status(503), 503), false));
         self::assertFalse($verdict->isServiceFailure(RtryAttemptOutcome::failure(HttpFailure::status(404), 503), false), 'the response, not the claim');
         self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(new \RuntimeException('x'), 503, [], null, true), false));
-        self::assertFalse($verdict->isServiceFailure(RtryAttemptOutcome::failure(HttpFailure::status(503), 503, [], null, false), false));
+        // false says only that the status is not the response's (2.4.1): the response decides.
+        self::assertTrue($verdict->isServiceFailure(RtryAttemptOutcome::failure(HttpFailure::status(503), 503, [], null, false), false));
+        self::assertFalse($verdict->isServiceFailure(RtryAttemptOutcome::failure(HttpFailure::status(404), 503, [], null, false), false));
 
         // Another library's outcome: same.
         self::assertFalse($verdict->isServiceFailure(TestOutcome::failure(503), false));

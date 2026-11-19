@@ -27,12 +27,17 @@ use Gohany\Rtry\Impl\RtryAttemptOutcome;
  *   a broken pipe, a certificate failure, by phrase, cURL error number, errno name, SQLSTATE or
  *   a database driver's connection error number.
  *
- * Anything else is a success: a 404 or a 422 (the service answered), a DEADLOCK (the database
- * answered: contention, not an outage), a validation error, an error with nothing to go on.
+ * Anything else is a success: a 404 or a 422 (the service answered), a DEADLOCK or a lock wait
+ * timeout (the database answered: contention, not an outage; the ETIMEDOUT a lock timeout's
+ * words also give does not count beside DEADLOCK), a database error whose SQLSTATE says it
+ * answered about the values it was sent (a duplicate key: its message echoes them and is not
+ * read), a validation error, an error with nothing to go on.
  *
- * Where the status came from: an RtryAttemptOutcome from Rtry's classifier knows
- * (statusFromResponse()); for any other outcome this verdict looks for a response on the error
- * itself, with $reader first when given, and ignores the outcome's status when there is none.
+ * Where the status came from: an outcome whose statusFromResponse() is true read it from a
+ * response, and it is trusted. For any other outcome (false says only that the status is not the
+ * response's: an exception code, a rule's constant) this verdict looks for a response on the
+ * error itself, with $reader first when given, and ignores the outcome's status when there is
+ * none.
  *
  * With countRetryable: false the policy's answer is ignored and only the service's counts, so a
  * 404 retried under on=default,404 keeps the circuit closed; but then an outage the policy
@@ -86,8 +91,16 @@ final class ServiceFailureVerdict implements BreakerVerdictInterface
         if ($status === 408 || $status === 429 || ($status !== null && $status >= 500 && $status <= 599)) {
             return true;
         }
+        $tags = [];
         foreach ($outcome->tags() as $tag) {
-            if (isset($this->unavailableTags[strtoupper((string) $tag)])) {
+            $tags[strtoupper((string) $tag)] = true;
+        }
+        if (isset($tags[FailureToken::DEADLOCK])) {
+            // A lock wait timeout: the database answered, whatever its words say about time.
+            unset($tags[FailureToken::ETIMEDOUT]);
+        }
+        foreach ($tags as $tag => $_) {
+            if (isset($this->unavailableTags[$tag])) {
                 return true;
             }
         }
@@ -97,12 +110,13 @@ final class ServiceFailureVerdict implements BreakerVerdictInterface
 
     /**
      * The status of the response the failure carries: null when there is none, 0 when there is
-     * one without a status from 100 to 599.
+     * one without a status from 100 to 599. Only statusFromResponse() true is taken on trust;
+     * false is also FailureMetadata's default, so it never means "no response".
      */
     private function responseStatus(AttemptOutcomeInterface $outcome): ?int
     {
-        if ($outcome instanceof RtryAttemptOutcome && $outcome->statusFromResponse() !== null) {
-            return $outcome->statusFromResponse() ? ($outcome->statusCode() ?? 0) : null;
+        if ($outcome instanceof RtryAttemptOutcome && $outcome->statusFromResponse() === true) {
+            return $outcome->statusCode() ?? 0;
         }
         $error = $outcome->error();
         return $error === null ? null : $this->locator->read($error)?->statusCode;

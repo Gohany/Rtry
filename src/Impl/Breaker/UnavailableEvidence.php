@@ -2,6 +2,8 @@
 
 namespace Gohany\Rtry\Impl\Breaker;
 
+use Gohany\Rtry\Impl\DatabaseAnswer;
+
 /**
  * Whether a thrown error shows that a downstream service could not be reached or could not
  * take the call, from its type, a driver's connection error number, a cURL error number, an
@@ -12,7 +14,8 @@ namespace Gohany\Rtry\Impl\Breaker;
  * Never from an exception code alone: a code counts only on a database driver's own exception
  * (PDOException, mysqli_sql_exception), as its connection error number. The message of a
  * LogicException or an \Error (a bug or a validation error) is never read; its previous
- * errors still are.
+ * errors still are. Nor is the message of a database error whose SQLSTATE says the database
+ * answered (DatabaseAnswer): "Duplicate entry 'broken pipe'" echoes what the caller sent.
  *
  * @internal
  */
@@ -92,7 +95,7 @@ final class UnavailableEvidence
                 return true;
             }
         }
-        if ($t instanceof \LogicException || $t instanceof \Error) {
+        if ($t instanceof \LogicException || $t instanceof \Error || DatabaseAnswer::is($t)) {
             return false;
         }
 
@@ -114,8 +117,9 @@ final class UnavailableEvidence
             return true;
         }
         // PDO's own formats: "SQLSTATE[08006] ...", "SQLSTATE[HY000] [2002] ...",
-        // "SQLSTATE[HY000]: General error: 2006 MySQL server has gone away".
-        if (preg_match('~sqlstate\[([0-9a-z]{5})\](?::\s*general error:\s*|\s*\[)?(\d{4})?~', $message, $m)) {
+        // "SQLSTATE[HY000]: General error: 2006 MySQL server has gone away". The code ends at a
+        // digit boundary: PDO_OCI's "General error: 20060 ... ORA-20060" is not MySQL's 2006.
+        if (preg_match('~sqlstate\[([0-9a-z]{5})\](?::\s*general error:\s*|\s*\[)?(\d{4}(?!\d))?~', $message, $m)) {
             if (preg_match(self::SQLSTATE_PATTERN, strtoupper($m[1]))) {
                 return true;
             }
