@@ -2,18 +2,23 @@
 
 ## 2.5.1 (Unreleased)
 
-Tests and documentation from the re-verification of PR #12 (three nits). No code changes:
+Tests and documentation from the re-verifications of PR #12 and PR #13. No code changes:
 every error reads, retries and counts as on 2.5.0.
 
 ### Tests
 
 - **The OCI-call rule is pinned edge by edge.** Five of fourteen mutants of the rule that makes
   an error Oracle's (`DatabaseAnswer::OCI_CALL`) left the suite green. Without the `^` anchor,
-  `Duplicate entry 'OCIStmtExecute: connection refused' for key 'u'` (1062, hand-built or
-  mysqli) was read as Oracle's, its words were read, and it was retried and opened the circuit.
-  Each mutant now fails a test: the name in a value, after a newline in a value, after leading
-  whitespace, with a digit (`OCI8: `, not Oracle's) and with an underscore (PDO_OCI's own
-  `OCI_NEED_DATA: OCI_NEED_DATA (...)`, which under 1205 is not a lock wait timeout).
+  `Duplicate entry 'OCIStmtExecute: connection refused' for key 'u'` (1062, hand-built or from
+  PDO's fields; through mysqli, the same value in a 1366 `Incorrect string value` under `HY000`)
+  would be read as Oracle's, its words read, and it would be retried and open the circuit. No
+  release did that: 2.4.1 and 2.5.0 read it as an answer. Each mutant now fails a test: the
+  name in a value, after a newline in a value, after leading whitespace, with a digit (`OCI8: `,
+  not Oracle's) and with an underscore (PDO_OCI's own `OCI_NEED_DATA: OCI_NEED_DATA (...)`,
+  which under 1205 is not a lock wait timeout).
+- **The mysqli test of that rule bites.** It used SQLSTATE `23000`, an answer before the rule is
+  asked, so it passed under every mutant; it now uses a 1366 under `HY000`, what a server sends
+  with a value in its text.
 - **Oracle errors outside the OCI-call rule are pinned as they read.** See Docs.
 
 ### Docs
@@ -21,8 +26,9 @@ every error reads, retries and counts as on 2.5.0.
 - **README, "Database errors": Oracle errors that do not start with an OCI call's name keep
   MySQL's reading of their number**, as on 2.4.1 and 2.5.0: PDO_OCI's failed attach
   (`pdo_oci_handle_factory: ORA-...`) and yajra/pdo-via-oci8's `Oci8Exception` (its code the
-  ORA number): ORA-01205 and ORA-01213 are retried as deadlocks. Through PDO_OCI, ORA-01040 and
-  ORA-01053 count as MySQL's connection numbers 1040 and 1053, as on 2.4.0.
+  ORA number): ORA-01205 and ORA-01213 are retried as deadlocks. Through PDO_OCI, ORA-01040,
+  ORA-01053, ORA-02002, ORA-02003, ORA-02005, ORA-02006, ORA-02013 and ORA-02055 count as
+  MySQL's connection numbers with the same digits, as on 2.4.0.
 - **2.5.0's entry for the hand-built `PDOException` no longer lists MySQL's 4031 as moved.** A
   hand-built 4031 with MySQL's idle-disconnect text already counted on 2.4.1, by number alone;
   what moved at 4031 for that shape is MariaDB's text, which has its own entry.

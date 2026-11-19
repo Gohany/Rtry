@@ -6,6 +6,7 @@ use Gohany\Retry\Testing\FrozenClock;
 use Gohany\Retry\Testing\RecordingSleeper;
 use Gohany\Retry\Testing\SeededRandom;
 use Gohany\Rtry\Impl\Breaker\ServiceFailureVerdict;
+use Gohany\Rtry\Impl\Breaker\UnavailableEvidence;
 use Gohany\Rtry\Impl\DatabaseAnswer;
 use Gohany\Rtry\Impl\Retry;
 use Gohany\Rtry\Impl\RtryAttemptOutcome;
@@ -27,6 +28,14 @@ use PHPUnit\Framework\TestCase;
  * Nit 2: Oracle errors that do not start with an OCI call's name keep MySQL's reading of their
  *   number, as on 2.4.1 and 2.5.0. Documented (README, "Database errors"), not changed in a
  *   patch release; pinned here so a later change is a deliberate one.
+ *
+ * The re-verification of PR #13 at fbfc977 (Gohany/Rtry#13), also for 2.5.1:
+ * Nit 1: the mysqli test used SQLSTATE 23000, an answer before the OCI-call rule is asked, so
+ *   it passed under every mutant. It now uses what a server sends: a value error (1366) under
+ *   HY000.
+ * Nit 2: the README named ORA-01040 and ORA-01053 as counting; every number in
+ *   UnavailableEvidence::MYSQL_CODES but 4031 does. The README lists each, pinned below.
+ * Nit 3: the CHANGELOG told a mutant's reading as something a release did.
  */
 final class OracleRuleFindingsTest extends TestCase
 {
@@ -61,20 +70,22 @@ final class OracleRuleFindingsTest extends TestCase
         ];
     }
 
-    /** @return iterable<string, array{string}> the 1062 texts each edge below pins */
+    /** @return iterable<string, array{string}> a mysqli 1366's texts for the edges below */
     public static function notOraclesTexts(): iterable
     {
-        yield 'inside a value' => ["Duplicate entry 'OCIStmtExecute: connection refused' for key 'u'"];
-        yield 'after a newline in a value' => ["Duplicate entry 'x\nOCIStmtExecute: connection refused' for key 'u'"];
-        yield 'a name with digits' => ["OCI8: Duplicate entry 'connection refused' for key 'u'"];
+        // A value error is what a server files under HY000 with the value in its text; under
+        // 23000 the error is an answer before the OCI-call rule is asked, and nothing is pinned.
+        yield 'inside a value' => ["Incorrect string value: 'OCIStmtExecute: connection refused' for column 'app'.'t'.'c' at row 1"];
+        yield 'after a newline in a value' => ["Incorrect string value: 'x\nOCIStmtExecute: connection refused' for column 'app'.'t'.'c' at row 1"];
+        yield 'a name with digits' => ["OCI8: Incorrect string value: 'connection refused' for column 'app'.'t'.'c' at row 1"];
     }
 
     #[DataProvider('notOraclesTexts')]
     #[RequiresPhpExtension('mysqli')]
     public function testTheSameTextsAsAMysqliErrorAreNotOracles(string $text): void
     {
-        self::assertAnAnswer(DbErrors::mysqli('23000', 1062, $text), 'mysqli');
-        self::assertSame([1, []], self::attemptsAndSleeps('rtry:a=3;d=100;j=0;on=default', DbErrors::mysqli('23000', 1062, $text)));
+        self::assertAnAnswer(DbErrors::mysqli('HY000', 1366, $text), 'mysqli');
+        self::assertSame([1, []], self::attemptsAndSleeps('rtry:a=3;d=100;j=0;on=default', DbErrors::mysqli('HY000', 1366, $text)));
     }
 
     private static function assertAnAnswer(\Throwable $error, string $what): void
@@ -165,5 +176,51 @@ final class OracleRuleFindingsTest extends TestCase
         foreach ([1040 => 'ORA-01040: invalid character in password; logon denied', 1053 => 'ORA-01053: user storage address cannot be read'] as $n => $ora) {
             self::assertTrue(self::counts(PdoShaped::make("SQLSTATE[HY000]: OCISessionBegin: $ora (ext/pdo_oci/oci_driver.c:179)", $n, null)), (string) $n);
         }
+    }
+
+    // ---- Re-verification of #13 -------------------------------------------------------------
+
+    /** @return array<int, string> every MySQL connection number Oracle's own number counts as, by ORA number */
+    private static function oraclesCountingNumbers(): array
+    {
+        // 4031 counts only with MySQL's text; ORA-04031 does not (PatchReverifyFindingsTest).
+        $numbers = [];
+        foreach (array_diff(UnavailableEvidence::MYSQL_CODES, [4031]) as $n) {
+            $numbers[$n] = sprintf('ORA-%05d', $n);
+        }
+        return $numbers;
+    }
+
+    public function testEveryOracleNumberThatCountsThroughPdoOciCounts(): void
+    {
+        foreach (self::oraclesCountingNumbers() as $n => $ora) {
+            $text = "OCIStmtExecute: $ora: some Oracle text (ext/pdo_oci/oci_statement.c:159)";
+            self::assertTrue(self::counts(PdoShaped::make("SQLSTATE[HY000]: General error: $n $text", 'HY000', ['HY000', $n, $text])), $ora);
+        }
+    }
+
+    public function testTheReadmeListsEveryOracleNumberThatCounts(): void
+    {
+        $readme = (string) file_get_contents(__DIR__ . '/../README.md');
+        $start = strpos($readme, "- an Oracle error whose text does not start with an OCI call's name");
+        self::assertNotFalse($start);
+        $end = strpos($readme, "\n- ", $start + 1);
+        $bullet = substr($readme, $start, $end === false ? null : $end - $start);
+        foreach (self::oraclesCountingNumbers() as $ora) {
+            self::assertStringContainsString($ora, $bullet);
+        }
+    }
+
+    public function testTheChangelogDoesNotTellAMutantAsARelease(): void
+    {
+        // The unanchored rule is a mutant: 2.4.1 and 2.5.0 read the text as an answer (above).
+        $changelog = (string) file_get_contents(__DIR__ . '/../CHANGELOG.md');
+        $start = strpos($changelog, '## 2.5.1 (Unreleased)');
+        $end = strpos($changelog, '## 2.5.0');
+        self::assertNotFalse($start);
+        self::assertNotFalse($end);
+        $entry = substr($changelog, $start, $end - $start);
+        self::assertStringNotContainsString('was read as Oracle', $entry);
+        self::assertStringContainsString('would be read as Oracle', $entry);
     }
 }

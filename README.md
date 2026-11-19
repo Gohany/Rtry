@@ -229,8 +229,10 @@ Not covered, and read as before, so a value in them can still look like an outag
   and session errors do (`OCIStmtExecute: ORA-...`): PDO_OCI's failed attach
   (`pdo_oci_handle_factory: ORA-...`) and yajra/pdo-via-oci8's `Oci8Exception` (its code the
   ORA number, its message `ORA-...`) keep MySQL's reading of that number, so ORA-01205 and
-  ORA-01213 are retried as deadlocks. Through PDO_OCI too, ORA-01040 and ORA-01053 count toward
-  the breaker as MySQL's connection numbers 1040 and 1053, as in 2.4.0;
+  ORA-01213 are retried as deadlocks. Through PDO_OCI too, ORA-01040, ORA-01053, ORA-02002,
+  ORA-02003, ORA-02005, ORA-02006, ORA-02013 and ORA-02055 count toward the breaker as MySQL's
+  connection numbers with the same digits, as in 2.4.0; ORA-02055 ("distributed update
+  operation failed; rollback required") is one a healthy database sends;
 - MongoDB's `E11000 duplicate key error ... dup key: { name: "broken pipe" }`, and a
   `pg_query()` warning raised as an `ErrorException`;
 - a framework's exception that keeps only the driver's code and drops the driver's exception
