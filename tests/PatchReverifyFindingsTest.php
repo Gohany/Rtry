@@ -22,7 +22,7 @@ use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
 
 /**
- * The re-verification of PR #9 at df3d975 (2.4.1, 2026-11-19), fixed for 2.4.2.
+ * The re-verification of PR #9 at df3d975 (2.4.1, 2026-11-19), fixed for 2.5.0.
  *
  * Should-fix 1: 4031 counted by number alone. On MariaDB it is a DDL answer ("Referenced
  *   trigger ... does not exist"), not MySQL's idle disconnect, and it opened the circuit.
