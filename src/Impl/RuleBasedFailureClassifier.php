@@ -266,6 +266,7 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
     {
         $tags = [];
         $unread = DatabaseAnswer::unread($e, self::MAX_DEPTH);
+        $quotedTags = DatabaseAnswer::quotedTags($e, self::MAX_DEPTH);
         for ($t = $e, $depth = 0; $t !== null && $depth < self::MAX_DEPTH; $t = $t->getPrevious(), $depth++) {
             foreach (self::TRANSPORT_TYPES as $type) {
                 if ($t instanceof $type) {
@@ -284,8 +285,14 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
             // A LogicException or an \Error is a bug or a validation error, whatever it says; a
             // database's answer (a duplicate key, a value MySQL could not take) echoes the values
             // it was sent, and so does an error wrapping one that quotes it, so their words are
-            // not the caller's to choose tags with. Other errors, above or below, are read.
-            if ($t instanceof \LogicException || $t instanceof \Error || isset($unread[$depth])) {
+            // not the caller's to choose tags with. Other errors, above or below, are read. A
+            // wrapper quoting an answer gets what the server's own text in the quote names, where
+            // 2.4.0 read it from the wrapper's words, so the order is 2.4.0's.
+            if ($t instanceof \LogicException || $t instanceof \Error) {
+                continue;
+            }
+            if (isset($unread[$depth])) {
+                $tags = array_merge($tags, $quotedTags[$depth] ?? []);
                 continue;
             }
             $message = strtolower((string) $t->getMessage());

@@ -1,5 +1,79 @@
 # Changelog
 
+## 2.4.2 — Unreleased
+
+Fixes from the re-verification of PR #9 at 2.4.1 (two should-fixes and five nits), a breaker
+key out of an exception message, and a bound on the spread above a server's `Retry-After`. No
+public API removed. One retry change: the spread above a server's wait is smaller (under
+Changed). The other changes bring 2.4.0's behaviour back where 2.4.1 moved it unintentionally.
+
+### Fixed
+
+- **MariaDB's 4031 no longer opens the circuit.** 2.4.1 counted 4031 by number alone as
+  MySQL's idle disconnect. On MariaDB 4031 is a DDL answer (`Referenced trigger '...' for the
+  given action time and event type does not exist`, from `CREATE TRIGGER ... FOLLOWS` naming a
+  missing trigger), and through PDO_OCI it is ORA-04031 (shared pool exhausted); both opened
+  the circuit and, as a half-open probe, reopened it. 4031 now counts only with the start of
+  MySQL's text, `The client was disconnected by the server`, from the driver's fields or a
+  message, as ProxySQL's 1907 is read. MariaDB's idle disconnect is 2006 on PHP 8.2 and 8.5 and
+  counts as before. Not in 2.4.0, which did not count 4031 at all.
+- **A MySQL-compatible product's own outage under a MySQL number reads as in 2.4.0.**
+  MaxScale's `1927 Lost connection to backend server: network error (..., Connection refused)`
+  (MariaDB's 1927 is `Connection was killed`) is read for words whatever its text, and
+  SingleStore's `1735 Unable to connect to leaf ...` by number and text (MySQL's and MariaDB's
+  1735 is `Unknown partition '...'`, which stays an answer). Both retry and count again. From
+  their published texts; not checked against a live MaxScale 1927 or a SingleStore.
+- **A wrapper quoting a lock wait timeout keeps 2.4.0's tag order.** `'Saving failed: ' .
+  $e->getMessage()` over a 1205 or 3133 `PDOException` gave `["DEADLOCK","ETIMEDOUT"]`; it
+  gives `["ETIMEDOUT","DEADLOCK"]` again, as 2.4.0 read them from the wrapper's words. A wrapper
+  quoting an answer gets only the tags the server's own text names, never words from a value.
+- **A driver text shorter than 24 characters is not a quote.** 2.4.1 took any driver text as a
+  quote of the answer, so `cURL error 28: Operation timed out after 5000 milliseconds` with a
+  `SIGNAL` whose text is `Operation timed out` as its previous was not read (no `ETIMEDOUT`,
+  one attempt, a success for the breaker), and nor was a cache's `read error on connection`
+  over a `SIGNAL` with text `connection`. Both read as in 2.4.0 again. A wrapper quoting only a
+  short driver text that carries a value is read, as in 2.4.0 (README, "Database errors").
+- **`CircuitBreaker` no longer puts the key in an exception message.** When its
+  compare-and-set kept losing it threw `RuntimeException('Circuit breaker state for <key> kept
+  changing ...')`; keys can carry tenant ids and callers log messages. It now throws
+  `Impl\Breaker\CircuitStateContendedException` (a `RuntimeException`) with the same message
+  for every key and the key in `key()`, as gohany/retry's `CircuitOpenException`.
+
+### Changed
+
+- **The spread above a server's `Retry-After` is at most the larger of 1 s and 10 % of its
+  wait.** Since 2.3 the spread was the policy's whole jitter window for the next attempt:
+  after attempt 2 of `d=10s` up to 20 s on top of the server's time, which pushed the next
+  attempt toward `dl` (or, clipped at `dl`, to its last millisecond) for no benefit, since the
+  server had already said when to come back. The window is now scaled down to that bound, not
+  clipped, so the spread stays uniform over it. Never below the server's time and never past
+  `dl` or the scheduler's ceiling when the server's own wait fits them, as before; a window
+  already inside the bound (`d=100`, `cap=1s`) is unchanged, draw for draw.
+  `RtryScheduler::headerSpreadMs()` takes the server's wait as a new optional fourth argument
+  (without it, the 2.4.1 spread); `Retry`, `RtryScheduler::outcome()` and
+  `RtryAttemptOutcome::fromError()` pass it. `RtryScheduler::HEADER_SPREAD_MIN_MS` and
+  `HEADER_SPREAD_PERCENT` name the bound; no spec key changes.
+
+### Docs
+
+- README, "Database errors": 4031 by number and text; 1927 and 1735; the 24-character quote
+  minimum; a wrapper quoting only part of an answer (`substr()`, `htmlspecialchars()`) is read;
+  "proxies other than ProxySQL" widened to proxies and MySQL-compatible databases.
+- README, "Retry-After and deadlines", and SPEC.md: the bound on the spread.
+
+### Tests
+
+- `PatchReverifyFindingsTest`: each finding of the re-verification, plus the three mutation
+  survivors pinned (1907's whole text, the Oracle check before `READ_ANYWAY`, the string-code
+  fallback in `pdoFieldsSayDeadlock()`).
+- `HeaderSpreadBoundTest`: the bound per jitter mode and for a policy other than Rtry's, and
+  end to end from a spec to the recorded sleeps (`Retry-After: 20` twice under `d=10s;dl=60s`
+  sleeps 20 to 22 s each time, spread, and leaves the third attempt 8 s of `dl`).
+- `BreakerKeyNotInMessageTest`.
+- `RealMariaDbTest` (group `mariadb`, `RTRY_MARIADB_HOST`): a real 4031 from MariaDB 11.4
+  through PDO (emulated and native) and mysqli runs once and leaves the circuit closed; a
+  killed connection and the idle disconnect still count.
+
 ## 2.4.1 — Unreleased
 
 Fixes to the breaker verdict's matching from the re-verification of PR #7, the hostile

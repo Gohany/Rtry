@@ -164,11 +164,12 @@ final class Retry implements RetryerInterface, RetryHooksInterface
                 $now = $this->nowMs();
                 $outcome = RtryAttemptOutcome::fromMetadata($error, $metadata, $now);
                 if ($policy->followHeaders() && $outcome->notBeforeUnixMs() !== null) {
-                    // Spread above the server's time, never below it, and never past dl or
-                    // the scheduler's ceiling when the server's own time fits them.
+                    // Spread above the server's time, never below it, at most max(1 s, 10 %)
+                    // of its wait, and never past dl or the scheduler's ceiling when the
+                    // server's own time fits them.
                     $outcome = $outcome->spreadAboveServerTime(
                         $now,
-                        RtryScheduler::headerSpreadMs($policy, $attempt, $this->random),
+                        RtryScheduler::headerSpreadMs($policy, $attempt, $this->random, $outcome->notBeforeUnixMs() - $now),
                         $deadlineMs,
                         $this->scheduler->maxHeaderWaitMs(),
                     );

@@ -5,6 +5,7 @@ namespace Gohany\Rtry\Impl;
 use Gohany\Retry\AttemptContextInterface;
 use Gohany\Retry\AttemptOutcomeInterface;
 use Gohany\Retry\GiveUpReason;
+use Gohany\Retry\JitterInterface;
 use Gohany\Retry\RetryDecision;
 use Gohany\Retry\RetryPolicyInterface;
 use Gohany\Retry\RetrySchedulerInterface;
@@ -33,6 +34,12 @@ final class RtryScheduler implements RetrySchedulerInterface
 {
     /** The longest server-requested wait honoured by default: a day. */
     public const MAX_HEADER_WAIT_MS = 86_400_000;
+
+    /** The spread above a server's wait is at most the larger of this and HEADER_SPREAD_PERCENT of the wait. */
+    public const HEADER_SPREAD_MIN_MS = 1_000;
+
+    /** The spread above a server's wait is at most the larger of HEADER_SPREAD_MIN_MS and this percent of the wait. */
+    public const HEADER_SPREAD_PERCENT = 10;
 
     private readonly ClockInterface $clock;
     private readonly Randomizer $random;
@@ -88,8 +95,15 @@ final class RtryScheduler implements RetrySchedulerInterface
      * return together: the policy's jitter window on the backoff for the next attempt (capped),
      * drawn once. Full jitter of 100% on a 100 ms backoff spreads over [0, 100] ms above the
      * server's time; j=0 gives 0, the server's time exactly. Never below the server's time.
+     *
+     * Given the server's wait ($serverWaitMs, from now to its time), the spread is at most the
+     * larger of HEADER_SPREAD_MIN_MS and HEADER_SPREAD_PERCENT of that wait: the server has
+     * already said when to come back, and a whole backoff step on top (20 s after attempt 2 of
+     * d=10s) pushes the next attempt toward dl for nothing. A wider window is scaled down to
+     * the bound, not clipped at it, so the spread stays spread. Retry, outcome() and
+     * RtryAttemptOutcome::fromError() pass the wait; without it the spread is 2.4.1's.
      */
-    public static function headerSpreadMs(RetryPolicyInterface $policy, int $failedAttempt, Randomizer $random): int
+    public static function headerSpreadMs(RetryPolicyInterface $policy, int $failedAttempt, Randomizer $random, ?int $serverWaitMs = null): int
     {
         if ($failedAttempt >= $policy->attempts()) {
             return 0;
@@ -100,7 +114,32 @@ final class RtryScheduler implements RetrySchedulerInterface
             $backoff = min($backoff, $cap);
         }
         $backoff = max(0, $backoff);
-        return abs($policy->jitter()->apply($backoff, $random) - $backoff);
+        $jitter = $policy->jitter();
+        $spread = abs($jitter->apply($backoff, $random) - $backoff);
+        if ($serverWaitMs === null) {
+            return $spread;
+        }
+        $bound = max(self::HEADER_SPREAD_MIN_MS, intdiv(max(0, $serverWaitMs), 100) * self::HEADER_SPREAD_PERCENT);
+        $window = self::jitterWindowMs($jitter, $backoff);
+        if ($window <= $bound) {
+            // Within the bound already (or a jitter wider than its declared window: clip it).
+            return min($spread, $bound);
+        }
+        return (int) floor(min($spread, $window) / $window * $bound);
+    }
+
+    /**
+     * The widest spread $jitter can give on $backoff (gohany/retry SPEC 6.2): full jitter draws
+     * from [max(0, D - w), D], pm from [D - w, D + w], none gives D.
+     */
+    private static function jitterWindowMs(JitterInterface $jitter, int $backoff): int
+    {
+        if ($jitter->mode() === JitterInterface::MODE_NONE) {
+            return 0;
+        }
+        $percent = $jitter->percent();
+        $window = $percent !== null ? (int) round($percent / 100.0 * $backoff) : max(0, (int) $jitter->windowMs());
+        return $jitter->mode() === JitterInterface::MODE_PM ? $window : min($window, $backoff);
     }
 
     public function next(RetryPolicyInterface $policy, AttemptOutcomeInterface $outcome, AttemptContextInterface $context): RetryDecision

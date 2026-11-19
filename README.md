@@ -166,7 +166,7 @@ A database error that is the database answering about what it was sent (a duplic
 value it could not take) echoes that value: MySQL's `Duplicate entry 'timed out' for key
 'name'`, `Incorrect integer value: 'connection refused' for column 'qty'`. Rtry never reads such
 an error's message for transport words, nor the message of an error wrapping it that quotes
-it, its message or the driver's text in any case (Laravel's `QueryException` with the bindings
+it, its message or the driver's text (24 characters or more) in any case (Laravel's `QueryException` with the bindings
 it appends, a Doctrine DBAL wrapper, your own `RuntimeException('Saving failed: ' .
 $e->getMessage(), 0, $e)`): it runs once and the breaker's verdict counts it as a success. An
 error above it that does not quote it is read, since its words are its own: a cache's `read
@@ -183,17 +183,23 @@ error:
 - or a MySQL server error number (1000 to 1999, 3000 to 5999), from `errorInfo`, a mysqli
   code, or PDO's `General error: 1366` and `[1049]`. MySQL files many value errors under
   `HY000`, so the SQLSTATE cannot tell: 1366, 1525, 1411, 1298, and the connect errors 1049
-  (`Unknown database 'tenant_...'`) and 1045. Not the connection numbers 1040, 1053 and 4031,
-  Oracle's ORA numbers (PDO_OCI files them under `HY000`), or the numbers whose text is not
-  the server's answer, which are read as before whatever their SQLSTATE: 1105, 1815, 1317, 1203
-  and 1041, which Vitess, TiDB and proxies send with their own text, outages included (Vitess
-  sends a deadline or a cancel as 1317, an internal error as 1815); 1296, 1297, 1429 and 1430,
-  an engine (FEDERATED, NDB) relaying another server's error; and ProxySQL's own query timeout,
-  `1907 Query execution was interrupted, query_timeout exceeded` (by number and text: MariaDB's
-  1907 is an answer).
+  (`Unknown database 'tenant_...'`) and 1045. Not the connection numbers 1040 and 1053, nor
+  4031 with MySQL's idle-disconnect text (below), Oracle's ORA numbers (PDO_OCI files them
+  under `HY000`), or the numbers whose text is not the server's answer, which are read as
+  before whatever their SQLSTATE: 1105, 1815, 1317, 1203 and 1041, which Vitess, TiDB and
+  proxies send with their own text, outages included (Vitess sends a deadline or a cancel as
+  1317, an internal error as 1815); 1296, 1297, 1429 and 1430, an engine (FEDERATED, NDB)
+  relaying another server's error; 1927, MariaDB's `Connection was killed`, which MaxScale
+  sends with its own text (`Lost connection to backend server: network error (node2,
+  Connection refused)`); and, by number and text, ProxySQL's own query timeout, `1907 Query
+  execution was interrupted, query_timeout exceeded` (MariaDB's 1907 is an answer), and
+  SingleStore's `1735 Unable to connect to leaf ...` (MySQL's and MariaDB's 1735 is `Unknown
+  partition '...'`, an answer).
 
-A connection SQLSTATE (class 08, 57P01 to 57P03, 53300), a connection number (2002, 2003,
-2005, 2006, 2013, 2055, and 4031, MySQL's idle disconnect as PHP 8.5 reports it), any other
+A connection SQLSTATE (class 08, 57P01 to 57P03, 53300), a connection number (1040, 1053,
+2002, 2003, 2005, 2006, 2013, 2055, and 4031, MySQL's idle disconnect as PHP 8.5 reports it,
+by number and the start of MySQL's text `The client was disconnected by the server`: MariaDB's
+4031 is a DDL answer, `Referenced trigger '...' ... does not exist`), any other
 client error (2000 to 2999), a proxy's own number and a transport exception type are read as
 before, and count. Proxies use numbers outside MySQL's range (ProxySQL's 9001 `Max connect
 timeout reached`) and inside it (its 1907, above); every number ProxySQL 2.7 sends of its own
@@ -218,7 +224,11 @@ Not covered, and read as before, so a value in them can still look like an outag
 - an error in any other SQLSTATE class that carries its SQL and bindings, such as Laravel's
   `QueryException` over PostgreSQL's 55P03 or 57014;
 - an error above a database's answer that echoes the value in its own words without quoting
-  the answer (`"Could not save product 'broken pipe'"`): it is read, as in 2.4.0.
+  the answer (`"Could not save product 'broken pipe'"`), or quotes only part of it
+  (`substr($e->getMessage(), 0, 100)`, `htmlspecialchars($e->getMessage())`, the message with
+  its whitespace collapsed), or quotes a driver text shorter than 24 characters (a `SIGNAL`'s
+  `Operation timed out`, so that a `cURL error 28: Operation timed out after 5000
+  milliseconds` above it is still a timeout): it is read, as in 2.4.0.
 
 The other way round, some outages or real timeouts are not read as such:
 
@@ -234,8 +244,11 @@ The other way round, some outages or real timeouts are not read as such:
 - MySQL's 1153 `Got a packet bigger than 'max_allowed_packet' bytes` comes with SQLSTATE
   `08S01`, and MySQL closes the connection, so it counts as an outage, as in 2.4.0, though a
   value too large for the server caused it;
-- proxies other than ProxySQL (MaxScale, RDS Proxy) were not checked: an error of their own
-  sent under a MySQL server number is read as the server's answer.
+- proxies and MySQL-compatible databases other than those named above (RDS Proxy, TiDB's and
+  Vitess's own texts beyond the numbers listed, SingleStore's other errors) were not checked
+  live: an error of their own sent under a MySQL server number is read as the server's answer.
+  MaxScale's 1927 and SingleStore's 1735 are read from their published texts, not from a live
+  server: MaxScale 23.08 sent PHP 2006 (which counts) in the outages it was put through.
 
 If these matter to you, pass a decider that replaces `on`, or a breaker verdict of your own
 (`Contracts\BreakerVerdictInterface`).
@@ -265,7 +278,11 @@ above `cap` (gohany/retry SPEC 5.11). `fh=0` ignores the headers.
 - **Jittered above, never below.** Callers told the same `Retry-After` would otherwise return
   in the same millisecond, so Rtry adds the policy's jitter window for that attempt on top: with
   full jitter and a 100 ms backoff, `Retry-After: 2` waits between 2000 and 2100 ms. `j=0`
-  waits exactly what the server said. When the server's wait fits inside `dl`, the spread
+  waits exactly what the server said. The spread is at most the larger of 1 s and 10 % of the
+  server's wait (`RtryScheduler::HEADER_SPREAD_MIN_MS`, `HEADER_SPREAD_PERCENT`); a wider
+  window is scaled down to that, so after attempt 2 of `d=10s` a `Retry-After: 20` waits
+  between 20 and 22 s, not up to 40 s. The policy's own delay still applies when it is
+  longer (SPEC 5.11 takes the larger of the two). When the server's wait fits inside `dl`, the spread
   never pushes it past `dl` (on the durable path, build the outcome with the scheduler's
   `outcome()` and the attempt's context; see below).
 - **Bounded.** A wait past `dl` gives up with `DeadlineExceeded` without sleeping. So does a
