@@ -17,7 +17,10 @@ Rtry-specific behaviour the SPEC leaves to implementations:
   (100-599) is the status for `on`, and never silences tags. Tags come only from transport and
   deadlock evidence (types, cURL error numbers, errno names, SQLSTATEs, specific phrases
   including driver timeouts), never from a bare word, from a `LogicException`/`\Error`, or from the message of a
-  database error whose SQLSTATE class (21, 22, 23, 42, 44, 45, P0) says the database answered.
+  database's answer or an error wrapping one: a SQLSTATE in class 21, 22, 23, 42, 44, 45, P0 or
+  40001/40P01, or a MySQL server error number (1000-1999, 3000-5999), read from the database
+  error's own fields or from `SQLSTATE[...]` at the start of its message (README, "Database
+  errors").
   `Retry-After` is read on any response; `RateLimit-Reset*` and `X-RateLimit-Reset*` only on a
   429, a 503, or a response whose `RateLimit-Remaining`/`X-RateLimit-Remaining` is 0. Either
   wait tags `RATE_LIMITED` on a 403, 408, 429 or 5xx, never on another 4xx or below 400.

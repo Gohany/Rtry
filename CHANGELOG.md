@@ -2,10 +2,10 @@
 
 ## 2.4.1 — Unreleased
 
-Fixes to the breaker verdict's matching from the re-verification of PR #7. No public API
-changes. One retry change, for an error no one meant to retry: a database error whose SQLSTATE
-says the database answered about the values it was sent no longer gets transport tags from its
-message (under Fixed).
+Fixes to the breaker verdict's matching from the re-verification of PR #7 and the hostile
+review of PR #8. No public API changes. One retry change: a database's answer about the values
+it was sent no longer gets transport tags from its message, so it runs once (under Fixed, with
+what it reaches and the rule that brings a retry back).
 
 ### Fixed
 
@@ -18,29 +18,75 @@ message (under Fixed).
   read the 404's message: `Not found: /search?q=connection refused` counted. The verdict now
   trusts only true; otherwise it reads the response on the error itself (false says only that
   the status is not the response's). `statusFromResponse()` itself is unchanged.
-- **A database error that echoes what it was sent cannot open a circuit, or retry.** A
-  database error whose SQLSTATE is in class 21, 22, 23, 42, 44, 45 (MySQL's `SIGNAL`) or P0
-  (PostgreSQL's `RAISE`), from a `PDOException`'s `errorInfo` or code, a `getSqlState()` method
-  (mysqli, Doctrine DBAL's driver exceptions) or `SQLSTATE[…]` anywhere in the message, is not
-  read for words. MySQL echoes the submitted value, so
-  `SQLSTATE[23000]: … Duplicate entry 'broken pipe' for key 'products.name'` let anyone who
-  can submit a unique field open the database's circuit through the verdict, and
-  `Duplicate entry 'timed out'` got `ETIMEDOUT` from the classifier (since 2.3), so it retried
-  under `on=default` and opened the circuit without a verdict. Both now run once and count as
-  the database answering. Class 08, `HY000` and the rest are read as before.
+- **A database's answer about what it was sent cannot open a circuit, or retry.** MySQL echoes
+  the submitted value, so `SQLSTATE[23000]: ... Duplicate entry 'broken pipe' for key
+  'products.name'` let anyone who can submit a unique field open the database's circuit through
+  the verdict, and `Duplicate entry 'timed out'` got `ETIMEDOUT` from the classifier (since
+  2.3), so it retried under `on=default` and opened the circuit without a verdict. MySQL files
+  many value errors under `HY000`, so a quantity field or a date filter was enough:
+  `General error: 1366 Incorrect integer value: 'broken pipe'`, 1525, 1411, 1298, and the
+  connect errors `[1049] Unknown database 'tenant_...'` and 1045. Such an error's message, and
+  the message of any error wrapping it (Laravel's `QueryException` with its bindings, a DBAL
+  wrapper), is no longer read for words. It is the database's answer when its SQLSTATE is in
+  class 21, 22, 23, 42, 44, 45 (MySQL's `SIGNAL`) or P0 (PostgreSQL's `RAISE`) or is
+  40001/40P01, or its number is a MySQL server error (1000 to 1999, 3000 to 5999; not 1105, 1429,
+  1430, a connection number or an ORA number), read only from the database error itself:
+  `errorInfo`, the code, `getSqlState()`, or PDO's `SQLSTATE[...]` and number at the very start
+  of a message. Server errors whose own text names contention or a timeout keep their tags by
+  number and that text (1205, 1213, 1614, 3058, 3132, 3133, 3699, 3781, 3840, 1639). Connection
+  SQLSTATEs and numbers, client errors (2000 to 2999), ProxySQL's 9001 and transport types count
+  as before. README, "Database errors", lists what is not covered: SQLite and Oracle (`HY000`
+  for everything), MongoDB's E11000, `pg_query()` warnings, a framework exception with only the
+  driver's code, and SQL with bindings appended to an error in another class.
+
+  What now runs once under `on=default` that 2.4.0 retried: such an error whose message carries a
+  timeout, reset or refused phrase, an errno name or a cURL number, whether in a value or in the
+  server's own words (other than the server errors above that keep their tags). That includes real timeouts a database reports as its answer: SQL Server
+  through ODBC files most server errors under `42000`, such as 8645 `A timeout occurred while
+  waiting for memory resources` and a linked server's `Query timeout expired`; a function or
+  trigger raising its own message (`SQLSTATE[P0001]: ... ledger service timed out`, `SIGNAL`
+  under 45000). To retry one again, add a rule:
+  `RuleBasedFailureClassifier::default()->addRule(new MessageRegexRule('~A timeout occurred while waiting for memory~', null, ['ETIMEDOUT']))`.
+- **A SQLSTATE in request text no longer switches transport evidence off.** In the unreleased
+  fix above, a `SQLSTATE[23000]` anywhere in any error's message made it an answer:
+  `file_get_contents(http://127.0.0.1:9/search?q=SQLSTATE[23000]): Failed to open stream:
+  Connection refused` ran once and told the breaker success, and as a half-open probe closed
+  the circuit on a dead service. A SQLSTATE now counts only from the database error's fields or
+  at the start of a message, and a transport type, connection SQLSTATE or connection number
+  always counts. Not in 2.4.0.
 - **A MySQL code in a message ends at a digit boundary.** PDO_OCI's
   `General error: 20060 … ORA-20060: credit limit exceeded` (an application error) was read as
   MySQL 2006, "server has gone away".
 - **A lock wait timeout is contention, like a deadlock.** MySQL 1205 `Lock wait timeout
-  exceeded` and PostgreSQL's lock timeout get `DEADLOCK` and, from their words, `ETIMEDOUT`;
-  the verdict counted the `ETIMEDOUT`, so they opened the circuit under `on=5xx` while 1213
-  `Deadlock found` did not. The verdict no longer counts `ETIMEDOUT` beside `DEADLOCK`. Tags
-  and retries are unchanged: `on=DEADLOCK` and `on=ETIMEDOUT` still match a lock timeout.
+  exceeded` (and 3133) and PostgreSQL's lock timeout (55P03) get `DEADLOCK` and `ETIMEDOUT`; the
+  verdict counted the `ETIMEDOUT`, so they opened the circuit under `on=5xx` while 1213
+  `Deadlock found` did not. The verdict no longer counts `ETIMEDOUT` beside `DEADLOCK` when the
+  error is a lock timeout, by its number and the server's text, its SQLSTATE, or a message that
+  starts with a lock timeout's words. A timeout that only names a deadlock
+  (`Read timed out ... for sku 'deadlock'`) still counts. Tags and retries are unchanged:
+  `on=DEADLOCK` and `on=ETIMEDOUT` still match a lock timeout.
+- **A connection SQLSTATE from `getSqlState()` counts.** A Doctrine DBAL `DriverException` with
+  `getSQLState()` `08S01` and a neutral message was a success; `errorInfo`, a string code and the
+  message were read, `getSqlState()` was not.
 - The docs said a validation error never opens the circuit. It does when the policy retries
   it (`InvalidArgumentException('…', 500)` under `on=default`), as in 2.3.
 
+### Docs
+
+- README: "Database errors", and an SDK that carries the status only as its exception code
+  (elasticsearch-php 7) needs a reader: without one its body's words are read.
+
 ### Tests
 
+- `TagReviewFindingsTest`: each probe from PR #8's review, in the shapes MySQL 8.0.43 really
+  throws through pdo_mysql and mysqli (1366, 1525, 1411, 1298, 1049, 1045, 1062, 1205, 2002,
+  2006, ProxySQL's 9001), Laravel's appended bindings, DBAL's wrappers, the request-text
+  outages, the timeout naming a deadlock, the rule that restores a retry, each SQLSTATE class
+  and field, the server-range edges, each `UnavailableEvidence` phrase alone and the vendor
+  transport types, with attempts and sleeps recorded under `on=5xx` and `on=default`.
+- `RealMysqlTest` (group `mysql`, skipped unless `RTRY_MYSQL_HOST` is set): the same against a
+  live MySQL.
+- `ReVerifyFindingsTest`: the tests the review found not proving their names now do.
 - `ReVerifyFindingsTest`: each probe from the re-verification (the three classifiers, the
   replaced 404, ORA-20060, duplicate entries echoing `broken pipe`, `timed out` and
   `connection refused` under `on=5xx` and `on=default` with the attempts and sleeps recorded,
