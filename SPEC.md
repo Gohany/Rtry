@@ -32,8 +32,11 @@ Rtry-specific behaviour the SPEC leaves to implementations:
   given the attempt's context, and a ceiling other than a day only when given it too.
 - **Breakers.** By default a failure the policy does not retry counts as a success for the
   circuit breaker, and one it retries as a failure. A `BreakerVerdictInterface` given to
-  `withGuard()` decides instead, from the outcome alone (`ServiceFailureVerdict`: 408, 429, 5xx
-  and transport tags are failures), and changes nothing else. `Retry` asks the breaker before each attempt and the budget before each retry.
+  `withGuard()` decides instead, given the outcome and whether the policy retries it
+  (`ServiceFailureVerdict`: what the policy retries, a 408, 429 or 5xx read from a response,
+  transport tags, and errors that show the service unreachable are failures; an exception code
+  alone never is). It never changes the scheduler's decision for an attempt; through the breaker
+  it changes whether the run goes on. `Retry` asks the breaker before each attempt and the budget before each retry.
   After a retryable failure it checks the breaker's state before sleeping: anything but
   closed ends the run at once with `CircuitOpen` and the operation's last error, without
   spending a budget token or waiting out the delay. A guard that throws never replaces the

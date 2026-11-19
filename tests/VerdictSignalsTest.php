@@ -369,6 +369,7 @@ final class VerdictSignalsTest extends TestCase
         yield 'phpredis read error' => [static fn () => new \RuntimeException('read error on connection to 10.0.0.9:6379')];
         yield 'broken pipe' => [static fn () => new \RuntimeException('fwrite(): Send of 512 bytes failed with errno=32 Broken pipe')];
         yield 'cURL 60, expired certificate' => [static fn () => new \RuntimeException('cURL error 60: SSL certificate problem: certificate has expired')];
+        yield 'cURL 6 by number alone' => [static fn () => new \RuntimeException('cURL error 6: see https://curl.se/libcurl/c/libcurl-errors.html')];
         yield 'cURL 35 by number' => [static fn () => new \RuntimeException('cURL error 35: OpenSSL SSL_connect: SSL_ERROR_SYSCALL')];
         yield 'host unreachable errno' => [static fn () => new \RuntimeException('connect EHOSTUNREACH 10.0.0.7:443')];
         yield 'wrapped' => [static fn () => new \RuntimeException('query failed', 0, self::pdo('SQLSTATE[HY000]: General error: 2006 MySQL server has gone away'))];
@@ -492,6 +493,7 @@ final class VerdictSignalsTest extends TestCase
 
         self::assertSame($notBefore[0], $notBefore[1]);
         self::assertGreaterThan(self::T0 + 5_000, $notBefore[0]);
+        self::assertTrue($scheduler->outcome($error, $policy, $context)->statusFromResponse(), 'the spread keeps where the status came from');
     }
 
     public function testTheSchedulersOutcomeWorksWithAPolicyThatIsNotAnRtryPolicy(): void
