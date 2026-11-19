@@ -168,6 +168,19 @@ final class RealMysqlTest extends TestCase
             mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
             new \mysqli(self::host(), 'root', 'x', 'rtry_probe', 1);
         }];
+        yield 'pdo idle disconnect (2006 on PHP 8.2, 4031 on 8.5)' => [static function (): void {
+            $idle = self::pdo();
+            $idle->exec('SET SESSION wait_timeout = 1');
+            sleep(3);
+            @$idle->query('SELECT 1'); // PHP 8.2's mysqlnd also warns "Packets out of order"
+        }];
+        yield 'mysqli idle disconnect' => [static function (): void {
+            mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+            $idle = new \mysqli(self::host(), 'root', self::password(), 'rtry_probe');
+            $idle->query('SET SESSION wait_timeout = 1');
+            sleep(3);
+            @$idle->query('SELECT 1');
+        }];
     }
 
     /** @param \Closure(): void $fn */

@@ -30,6 +30,11 @@ namespace Doctrine\DBAL\Exception {
         {
         }
     }
+    if (!class_exists(LockWaitTimeoutException::class)) {
+        class LockWaitTimeoutException extends \RuntimeException
+        {
+        }
+    }
 }
 
 namespace Predis\Connection {
