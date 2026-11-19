@@ -80,10 +80,16 @@ final class Retry implements RetryerInterface, RetryHooksInterface
      *
      * Without $verdict, a failure the policy does not retry (a 4xx, say) counts as a success
      * for the breaker (the service answered) and one it retries as a failure. With one, the
-     * verdict alone decides what each failed attempt tells the breaker, whatever the policy
-     * retries: ServiceFailureVerdict counts transport errors, 408, 429 and 5xx, so a refused
-     * connection under on=5xx still opens the circuit and a 404 retried under on=default,404
-     * does not. The verdict never changes the retries, sleeps or give-up reasons.
+     * verdict decides what each failed attempt tells the breaker, given the outcome and the
+     * policy's answer: ServiceFailureVerdict counts what the policy retries plus 408, 429 and
+     * 5xx read from a response and errors that show the service unreachable, so a refused
+     * connection under on=5xx opens the circuit and a validation error never does.
+     *
+     * The verdict never changes the scheduler's decision for an attempt (retry or not, the
+     * delay, its give-up reason). Through the breaker it changes whether the run goes on: a
+     * failure it reports can open the circuit and end the run with CircuitOpen; one it calls a
+     * success can keep the circuit closed, so the run goes on. Each call replaces the guard:
+     * a later withGuard() without a verdict has none.
      */
     public function withGuard(
         string $key,
@@ -173,18 +179,19 @@ final class Retry implements RetryerInterface, RetryHooksInterface
                     $this->context($attempt, $maxAttempts, $delay, $firstMs, $deadlineMs, $context),
                 );
                 $reason = $decision->giveUpReason();
+                $serviceFailure = $this->isServiceFailure($outcome, $reason !== GiveUpReason::NotRetryable);
 
                 // A failure the policy does not retry (a 404, a validation error) is the caller's
-                // business, not a retry event: debug. Never log the message: it can carry
-                // request data. Class, status and tags only.
-                $this->log($reason === GiveUpReason::NotRetryable ? 'debug' : 'warning', 'retry.failure', [
+                // business, not a retry event: debug, unless the breaker counts it. Never log the
+                // message: it can carry request data. Class, status and tags only.
+                $this->log($reason === GiveUpReason::NotRetryable && !$serviceFailure ? 'debug' : 'warning', 'retry.failure', [
                     'attempt' => $attempt,
                     'exception_class' => self::className($error),
                     'status_code' => $outcome->statusCode(),
                     'tags' => $outcome->tags(),
                 ]);
 
-                $this->report('breaker', $this->isServiceFailure($outcome, $reason) ? 'recordFailure' : 'recordSuccess');
+                $this->report('breaker', $serviceFailure ? 'recordFailure' : 'recordSuccess');
 
                 // A circuit open now (this failure opened it, a probe failed, or another worker
                 // opened it) would refuse the retry: give up without sleeping first.
@@ -250,20 +257,19 @@ final class Retry implements RetryerInterface, RetryHooksInterface
 
     /**
      * What a failed attempt tells the breaker: the verdict's answer when withGuard() was given
-     * one, otherwise whether the policy retries it. A verdict that throws falls back to the
-     * policy's answer and is logged as retry.guard_error (call "verdict").
+     * one and a breaker, otherwise whether the policy retries it. A verdict that throws falls
+     * back to the policy's answer and is logged as retry.guard_error (call "verdict").
      */
-    private function isServiceFailure(RtryAttemptOutcome $outcome, ?GiveUpReason $reason): bool
+    private function isServiceFailure(RtryAttemptOutcome $outcome, bool $retryable): bool
     {
-        $retried = $reason !== GiveUpReason::NotRetryable;
         if ($this->breaker === null || $this->verdict === null) {
-            return $retried;
+            return $retryable;
         }
         try {
-            return $this->verdict->isServiceFailure($outcome);
+            return $this->verdict->isServiceFailure($outcome, $retryable);
         } catch (Throwable $e) {
             $this->guardError('breaker', 'verdict', $e);
-            return $retried;
+            return $retryable;
         }
     }
 

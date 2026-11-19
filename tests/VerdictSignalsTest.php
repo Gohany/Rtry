@@ -302,7 +302,7 @@ final class VerdictSignalsTest extends TestCase
         $this->retry()->withGuard('api', null, $this->breaker(50), $verdict)->tryOutcome($op, (new RtryPolicyFactory())->fromSpec('rtry:a=4;d=100;on=5xx'));
 
         $this->setUp();
-        $this->retry()->withGuard('api', null, $this->breaker(50), $verdict)->tryOutcome(static fn (): never => throw HttpFailure::status(502), (new RtryPolicyFactory())->fromSpec('rtry:a=1;on=5xx'));
+        $this->retry()->withGuard('api', null, $this->breaker(50), $verdict)->tryOutcome(static fn (): never => throw HttpFailure::status(502), (new RtryPolicyFactory())->fromSpec('rtry:a=1;d=100;on=5xx'));
 
         self::assertSame([[503, true], [503, true], [404, false], [502, true]], $verdict->seen, 'out of attempts is still retryable');
     }

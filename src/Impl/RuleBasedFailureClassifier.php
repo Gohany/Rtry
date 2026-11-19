@@ -167,7 +167,9 @@ final class RuleBasedFailureClassifier implements FailureClassifierInterface, Ru
         }
         $tags = array_values(array_unique($tags));
 
-        return new FailureMetadata($status, $tags, $ctxPatch, $minNextDelayMs, $notBeforeUnixMs, $headers, $fromResponse);
+        // fromResponse says the status was read from the response: not when a later rule's
+        // status replaced the response's.
+        return new FailureMetadata($status, $tags, $ctxPatch, $minNextDelayMs, $notBeforeUnixMs, $headers, $fromResponse && $status === $responseStatus);
     }
 
     private static function isRetryableStatus(int $status): bool
