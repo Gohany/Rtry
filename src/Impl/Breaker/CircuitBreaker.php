@@ -115,7 +115,10 @@ final class CircuitBreaker implements CircuitBreakerInterface
         return [$row->version(), $state];
     }
 
-    /** @param callable(array{s:string,f:list<int>,o:int,p:int}, int): ?array $change null = no write */
+    /**
+     * @param callable(array{s:string,f:list<int>,o:int,p:int}, int): ?array $change null = no write
+     * @throws CircuitStateContendedException when the compare-and-set keeps losing
+     */
     private function update(string $key, callable $change): void
     {
         for ($try = 0; $try < self::MAX_CAS_TRIES; $try++) {
@@ -135,7 +138,7 @@ final class CircuitBreaker implements CircuitBreakerInterface
                 return;
             }
         }
-        throw new \RuntimeException('Circuit breaker state for ' . $key . ' kept changing; gave up after ' . self::MAX_CAS_TRIES . ' tries');
+        throw new CircuitStateContendedException($key, self::MAX_CAS_TRIES);
     }
 
     private function report(string $key, string $from, string $to, int $atUnixMs): void

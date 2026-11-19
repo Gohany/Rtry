@@ -52,8 +52,9 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
      * attempt number and the policy's classifier for you, so none of them is set twice.
      *
      * Pass the policy and the failed attempt's number so a server's Retry-After is spread
-     * above, never below (RtryScheduler::headerSpreadMs()): rows told the same Retry-After
-     * then do not all come due in the same millisecond. Leave $random null in production.
+     * above, never below, by at most max(1 s, 10 %) of the server's wait
+     * (RtryScheduler::headerSpreadMs()): rows told the same Retry-After then do not all come
+     * due in the same millisecond. Leave $random null in production.
      *
      * Pass the context you will give RtryScheduler::next() too: when the server's own time
      * fits inside its remainingBudgetMs() (dl), the spread then stays inside it, as in Retry.
@@ -82,7 +83,7 @@ final class RtryAttemptOutcome implements AttemptOutcomeInterface
         $remaining = $context?->remainingBudgetMs();
         return $outcome->spreadAboveServerTime(
             $now,
-            RtryScheduler::headerSpreadMs($policy, $failedAttempt, $random ?? new Randomizer()),
+            RtryScheduler::headerSpreadMs($policy, $failedAttempt, $random ?? new Randomizer(), $outcome->notBeforeUnixMs - $now),
             $remaining === null ? null : $now + HeaderWaits::clampDelta($remaining),
             $maxHeaderWaitMs,
         );

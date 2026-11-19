@@ -20,8 +20,8 @@ use Gohany\Rtry\Impl\Breaker\UnavailableEvidence;
  * "SQLSTATE[08006] is not a valid coupon code" is nothing here; its fields still are.
  *
  * The database answered when nothing there says connection (SQLSTATE class 08, 57P01-57P03,
- * 53300, or one of UnavailableEvidence::MYSQL_CODES), its number is not one whose text is
- * someone else's (READ_ANYWAY, PROXY_TEXTS), and
+ * 53300, or a MySQL connection number: UnavailableEvidence::isConnectionNumber()), its number is
+ * not one whose text is someone else's (READ_ANYWAY, PROXY_TEXTS), and
  *
  * - its SQLSTATE is in class 21 (cardinality), 22 (data), 23 (integrity constraint), 42
  *   (syntax or access rule), 44 (check option), 45 (MySQL's SIGNAL) or P0 (PostgreSQL's
@@ -35,8 +35,10 @@ use Gohany\Rtry\Impl\Breaker\UnavailableEvidence;
  *   databases' numbers fall outside and are read as before.
  *
  * Such an error's message echoes what the caller sent, so neither it nor the message of an
- * error wrapping it that quotes it (its message or the driver's text) is read for words
- * (unread()). The contention and timeouts the server's own text names keep their tags (tags()).
+ * error wrapping it that quotes it (its message or the driver's text, QUOTE_MIN_LENGTH
+ * characters or more) is read for words (unread()). The contention and timeouts the server's
+ * own text names keep their tags (tags()), and a wrapper quoting it gets the tags its words
+ * gave in 2.4.0 from that text (quotedTags()), so the order is 2.4.0's.
  *
  * @internal
  */
@@ -53,16 +55,29 @@ final class DatabaseAnswer
      * was interrupted", 1203 (max_user_connections) and 1041 (out of resources), which Vitess,
      * TiDB and proxies send with their own text, outages included (Vitess: DEADLINE_EXCEEDED,
      * CANCELED and ABORTED as 1317, INTERNAL as 1815, RESOURCE_EXHAUSTED as 1203 or 1041); and
-     * 1296, 1297, 1429 and 1430, an engine (FEDERATED, NDB) relaying another server's error.
+     * 1296, 1297, 1429 and 1430, an engine (FEDERATED, NDB) relaying another server's error;
+     * and 1927, MariaDB's "Connection was killed", which MaxScale sends with its own text
+     * ("Lost connection to backend server: network error (node2, Connection refused)").
      */
-    private const READ_ANYWAY = [1041, 1105, 1203, 1296, 1297, 1317, 1429, 1430, 1815];
+    private const READ_ANYWAY = [1041, 1105, 1203, 1296, 1297, 1317, 1429, 1430, 1815, 1927];
 
     /**
-     * A proxy's own error under a number that is something else on a MySQL server, by that
-     * number and the start of the proxy's text: read as before 2.4.1. ProxySQL's query_timeout
-     * (MySQL 8.0 has no 1907; MariaDB's is about a generated column and stays an answer).
+     * A proxy's or a MySQL-compatible database's own error under a number that is something
+     * else on a MySQL server, by that number and the start of its text: read as before 2.4.1.
+     * ProxySQL's query_timeout (MySQL 8.0 has no 1907; MariaDB's is about a generated column
+     * and stays an answer); SingleStore's leaf connect error (MySQL's and MariaDB's 1735 is
+     * "Unknown partition '%s' in table '%s'", which stays an answer).
      */
-    private const PROXY_TEXTS = [1907 => 'query execution was interrupted, query_timeout exceeded'];
+    private const PROXY_TEXTS = [
+        1907 => 'query execution was interrupted, query_timeout exceeded',
+        1735 => 'unable to connect to leaf',
+    ];
+
+    /**
+     * The shortest text taken as a quote of an answer. A shorter driver text ("connection", a
+     * SIGNAL's "Operation timed out") is as likely to be words of the error above it.
+     */
+    private const QUOTE_MIN_LENGTH = 24;
 
     /** MySQL's 1213 deadlock and 1205 lock wait timeout; SQL Server's 1205 deadlock victim. */
     private const DEADLOCK_NUMBERS = [1205, 1213];
@@ -115,8 +130,7 @@ final class DatabaseAnswer
             }
         }
         return $n !== null && !$id['oracle']
-            && (($n >= 1000 && $n <= 1999) || ($n >= 3000 && $n <= 5999))
-            && !in_array($n, UnavailableEvidence::MYSQL_CODES, true);
+            && (($n >= 1000 && $n <= 1999) || ($n >= 3000 && $n <= 5999));
     }
 
     /**
@@ -131,34 +145,71 @@ final class DatabaseAnswer
      */
     public static function unread(\Throwable $e, int $maxDepth): array
     {
+        return self::scan($e, $maxDepth)[0];
+    }
+
+    /**
+     * For each depth unread() gives that is not itself an answer (an error quoting one), the
+     * tags 2.4.0 read from the words it quotes: those the server's own text names (tags()),
+     * in that text's order. A wrapper quoting a 1205 gets ETIMEDOUT then DEADLOCK, as 2.4.0
+     * read them from its message; a wrapper quoting a duplicate key gets nothing.
+     *
+     * @return array<int, list<string>>
+     */
+    public static function quotedTags(\Throwable $e, int $maxDepth): array
+    {
+        return self::scan($e, $maxDepth)[1];
+    }
+
+    /** @return array{array<int, true>, array<int, list<string>>} */
+    private static function scan(\Throwable $e, int $maxDepth): array
+    {
         $chain = [];
         for ($t = $e, $depth = 0; $t !== null && $depth < $maxDepth; $t = $t->getPrevious(), $depth++) {
             $chain[] = $t;
         }
         $unread = [];
+        $quotedTags = [];
+        /** @var list<array{string, list<string>}> $quotes each quote and the tags its words gave in 2.4.0 */
         $quotes = [];
         for ($depth = count($chain) - 1; $depth >= 0; $depth--) {
             $t = $chain[$depth];
             if (self::is($t)) {
                 $unread[$depth] = true;
                 $id = self::identity($t);
+                $tags = self::textTags($id);
                 foreach ([strtolower($t->getMessage()), ...($id['texts'] ?? [])] as $quote) {
                     $quote = trim($quote);
-                    if ($quote !== '') {
-                        $quotes[] = $quote;
+                    if (strlen($quote) >= self::QUOTE_MIN_LENGTH) {
+                        $quotes[] = [$quote, $tags];
                     }
                 }
                 continue;
             }
             $message = strtolower($t->getMessage());
-            foreach ($quotes as $quote) {
+            foreach ($quotes as [$quote, $tags]) {
                 if (str_contains($message, $quote)) {
                     $unread[$depth] = true;
-                    break;
+                    $quotedTags[$depth] = array_values(array_unique(array_merge($quotedTags[$depth] ?? [], $tags)));
                 }
             }
         }
-        return $unread;
+        return [$unread, $quotedTags];
+    }
+
+    /**
+     * The tags the server's own text gives (MYSQL_TEXT_TAGS), by number and the start of that text.
+     *
+     * @param array{states: list<string>, number: ?int, texts: list<string>, oracle: bool}|null $id
+     * @return list<string>
+     */
+    private static function textTags(?array $id): array
+    {
+        $n = $id === null || $id['oracle'] ? null : $id['number'];
+        if ($n !== null && isset(self::MYSQL_TEXT_TAGS[$n]) && self::startsWith($id['texts'], self::MYSQL_TEXT_TAGS[$n][0])) {
+            return self::MYSQL_TEXT_TAGS[$n][1];
+        }
+        return [];
     }
 
     /** Whether $t's own SQLSTATE or number says connection: class 08 and the like, or a MySQL connection number. */
@@ -187,9 +238,7 @@ final class DatabaseAnswer
         if ($deadlock && self::pdoFieldsSayDeadlock($t)) {
             $tags[] = FailureToken::DEADLOCK;
         }
-        if ($n !== null && isset(self::MYSQL_TEXT_TAGS[$n]) && self::startsWith($id['texts'], self::MYSQL_TEXT_TAGS[$n][0])) {
-            $tags = array_merge($tags, self::MYSQL_TEXT_TAGS[$n][1]);
-        }
+        $tags = array_merge($tags, self::textTags($id));
         if ($deadlock) {
             $tags[] = FailureToken::DEADLOCK;
         }
@@ -279,7 +328,7 @@ final class DatabaseAnswer
                 return true;
             }
         }
-        return $id['number'] !== null && in_array($id['number'], UnavailableEvidence::MYSQL_CODES, true);
+        return $id['number'] !== null && UnavailableEvidence::isConnectionNumber($id['number'], $id['texts']);
     }
 
     /**

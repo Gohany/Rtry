@@ -42,9 +42,17 @@ final class UnavailableEvidence
      * MySQL / MariaDB: 1040 too many connections, 1053 server shutdown in progress, 2002 and
      * 2003 cannot connect, 2005 unknown host, 2006 server has gone away, 2013 and 2055 lost
      * connection, 4031 disconnected for inactivity (what PHP 8.5's mysqlnd reports where 8.2's
-     * says 2006).
+     * says 2006). A number in MYSQL_CODE_TEXTS counts only with its text: isConnectionNumber().
      */
     public const MYSQL_CODES = [1040, 1053, 2002, 2003, 2005, 2006, 2013, 2055, 4031];
+
+    /**
+     * Connection numbers that are something else on another server, by number and the start of
+     * MySQL's text. MySQL's 4031 is the idle disconnect; MariaDB's is a DDL answer ("Referenced
+     * trigger '%s' for the given action time and event type does not exist"), and Oracle's
+     * ORA-04031 through PDO_OCI is a shared pool exhausted.
+     */
+    private const MYSQL_CODE_TEXTS = [4031 => 'the client was disconnected by the server'];
 
     /**
      * SQLSTATE class 08 (connection exception), 57P01-57P03 (PostgreSQL shutting down or not
@@ -77,6 +85,28 @@ final class UnavailableEvidence
         'ssl certificate problem', 'certificate has expired', 'certificate verify failed',
         'ssl_connect', 'ssl handshake', 'tls handshake',
     ];
+
+    /**
+     * Whether $number is a MySQL connection number, given the driver's texts (lower-cased, any
+     * leading whitespace removed) that came with it.
+     *
+     * @param list<string> $texts
+     */
+    public static function isConnectionNumber(int $number, array $texts): bool
+    {
+        if (!in_array($number, self::MYSQL_CODES, true)) {
+            return false;
+        }
+        if (!isset(self::MYSQL_CODE_TEXTS[$number])) {
+            return true;
+        }
+        foreach ($texts as $text) {
+            if (str_starts_with($text, self::MYSQL_CODE_TEXTS[$number])) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     public static function in(\Throwable $e): bool
     {
@@ -124,11 +154,11 @@ final class UnavailableEvidence
         // PDO's own formats: "SQLSTATE[08006] ...", "SQLSTATE[HY000] [2002] ...",
         // "SQLSTATE[HY000]: General error: 2006 MySQL server has gone away". The code ends at a
         // digit boundary: PDO_OCI's "General error: 20060 ... ORA-20060" is not MySQL's 2006.
-        if (preg_match('~sqlstate\[([0-9a-z]{5})\](?::\s*general error:\s*|\s*\[)?(\d{4}(?!\d))?~', $message, $m)) {
+        if (preg_match('~sqlstate\[([0-9a-z]{5})\](?::\s*general error:\s*|\s*\[)?(\d{4}(?!\d))?\]?\s*(.*)~s', $message, $m)) {
             if (preg_match(self::SQLSTATE_PATTERN, strtoupper($m[1]))) {
                 return true;
             }
-            if (isset($m[2]) && $m[2] !== '' && in_array((int) $m[2], self::MYSQL_CODES, true)) {
+            if ($m[2] !== '' && self::isConnectionNumber((int) $m[2], [$m[3]])) {
                 return true;
             }
         }

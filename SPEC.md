@@ -29,8 +29,8 @@ Rtry-specific behaviour the SPEC leaves to implementations:
 - **Server waits.** `RtryScheduler::next()` follows SPEC 5.11 step 5, and also gives up with
   `DeadlineExceeded` when the server's wait exceeds its ceiling (a day by default). `Retry`,
   `RtryScheduler::outcome()`, and `RtryAttemptOutcome::fromError()` when given the policy, move the outcome's `notBeforeUnixMs`
-  later by the policy's jitter window for that attempt, so a Retry-After is jittered above and
-  never below. Whether a wait fits `dl` or the ceiling is decided by the server's time, not by
+  later by the policy's jitter window for that attempt, scaled down to at most the larger of
+  1 s and 10 % of the server's wait, so a Retry-After is jittered above and never below. Whether a wait fits `dl` or the ceiling is decided by the server's time, not by
   the spread: when it fits, the spread never pushes it past either. `outcome()` takes `dl` from
   the context it is given and the ceiling from its scheduler. `fromError()` knows `dl` only when
   given the attempt's context, and a ceiling other than a day only when given it too.
