@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.5.1 (Unreleased)
+## 2.5.1 — 2026-11-20
 
 Tests and documentation from the re-verifications of PR #12 and PR #13. No code changes:
 every error reads, retries and counts as on 2.5.0.
