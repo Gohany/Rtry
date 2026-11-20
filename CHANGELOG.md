@@ -12,7 +12,8 @@ every error reads, retries and counts as on 2.5.0.
   `Duplicate entry 'OCIStmtExecute: connection refused' for key 'u'` (1062, hand-built or from
   PDO's fields; through mysqli, the same value in a 1366 `Incorrect string value` under `HY000`)
   would be read as Oracle's, its words read, and it would be retried and open the circuit. No
-  release did that: 2.4.1 and 2.5.0 read it as an answer. Each mutant now fails a test: the
+  release read it as Oracle's; since 2.4.1 it is an answer (2.4.0 retried it and opened the
+  circuit by reading its words, the bug 2.4.1's entry records). Each mutant now fails a test: the
   name in a value, after a newline in a value, after leading whitespace, with a digit (`OCI8: `,
   not Oracle's) and with an underscore (PDO_OCI's own `OCI_NEED_DATA: OCI_NEED_DATA (...)`,
   which under 1205 is not a lock wait timeout).
@@ -20,6 +21,11 @@ every error reads, retries and counts as on 2.5.0.
   asked, so it passed under every mutant; it now uses a 1366 under `HY000`, what a server sends
   with a value in its text.
 - **Oracle errors outside the OCI-call rule are pinned as they read.** See Docs.
+- **The tests that read the README and this file survive a release and a re-wrap.** They find
+  this entry by `## 2.5.1`, so dating the heading keeps them green; they collapse whitespace
+  before matching, so re-wrapping a paragraph changes nothing, and a phrase the test forbids
+  cannot hide across a line break. The README's list of Oracle numbers that count is read up to
+  "count toward the breaker", so ORA-02055, named again in the remark after it, is pinned too.
 
 ### Docs
 
