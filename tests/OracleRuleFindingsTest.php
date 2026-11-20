@@ -36,6 +36,15 @@ use PHPUnit\Framework\TestCase;
  * Nit 2: the README named ORA-01040 and ORA-01053 as counting; every number in
  *   UnavailableEvidence::MYSQL_CODES but 4031 does. The README lists each, pinned below.
  * Nit 3: the CHANGELOG told a mutant's reading as something a release did.
+ *
+ * The re-verification of PR #14 at 7776726 (Gohany/Rtry#14), also for 2.5.1:
+ * Finding 1: the CHANGELOG test found its entry by "## 2.5.1 (Unreleased)", so dating the
+ *   heading for the tag turned it red. It finds "## 2.5.1".
+ * Nit 2: both doc tests matched phrases across the hard line wrap. They collapse whitespace
+ *   first.
+ * Nit 3: the README test looked through the whole bullet, which names ORA-02055 twice; it reads
+ *   the list only, up to "count toward the breaker".
+ * Nit 4: the CHANGELOG said no release retried these texts; 2.4.0 did, by reading their words.
  */
 final class OracleRuleFindingsTest extends TestCase
 {
@@ -201,26 +210,38 @@ final class OracleRuleFindingsTest extends TestCase
 
     public function testTheReadmeListsEveryOracleNumberThatCounts(): void
     {
-        $readme = (string) file_get_contents(__DIR__ . '/../README.md');
+        // Up to "count toward the breaker": the list, not the remark after it, which names
+        // ORA-02055 again.
+        $readme = self::words((string) file_get_contents(__DIR__ . '/../README.md'));
         $start = strpos($readme, "- an Oracle error whose text does not start with an OCI call's name");
         self::assertNotFalse($start);
-        $end = strpos($readme, "\n- ", $start + 1);
-        $bullet = substr($readme, $start, $end === false ? null : $end - $start);
+        $end = strpos($readme, 'count toward the breaker', $start);
+        self::assertNotFalse($end);
+        $list = substr($readme, $start, $end - $start);
         foreach (self::oraclesCountingNumbers() as $ora) {
-            self::assertStringContainsString($ora, $bullet);
+            self::assertStringContainsString($ora, $list);
         }
     }
 
     public function testTheChangelogDoesNotTellAMutantAsARelease(): void
     {
         // The unanchored rule is a mutant: 2.4.1 and 2.5.0 read the text as an answer (above).
-        $changelog = (string) file_get_contents(__DIR__ . '/../CHANGELOG.md');
-        $start = strpos($changelog, '## 2.5.1 (Unreleased)');
+        // "## 2.5.1", not "## 2.5.1 (Unreleased)": the heading is dated when the release is tagged.
+        $changelog = self::words((string) file_get_contents(__DIR__ . '/../CHANGELOG.md'));
+        $start = strpos($changelog, '## 2.5.1');
         $end = strpos($changelog, '## 2.5.0');
         self::assertNotFalse($start);
         self::assertNotFalse($end);
         $entry = substr($changelog, $start, $end - $start);
         self::assertStringNotContainsString('was read as Oracle', $entry);
         self::assertStringContainsString('would be read as Oracle', $entry);
+        // 2.4.0 did retry these texts and open the circuit, by reading their words.
+        self::assertStringNotContainsString('No release did that', $entry);
+    }
+
+    /** Whitespace collapsed, so a phrase matches however the paragraph is wrapped. */
+    private static function words(string $text): string
+    {
+        return (string) preg_replace('~\s+~', ' ', $text);
     }
 }
